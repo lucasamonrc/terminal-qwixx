@@ -1,0 +1,16 @@
+# Binaries
+qwixx
+*.exe
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+
+# SSH host keys (generated at runtime)
+*.pem
+ssh_host_*
