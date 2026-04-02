@@ -30,6 +30,10 @@ type AppModel struct {
 	room      *lobby.Room
 	isCreator bool
 
+	// Per-player event channels
+	roomEvents <-chan lobby.RoomEvent
+	gameEvents <-chan game.GameEvent
+
 	// Sub-models
 	nicknameModel NicknameModel
 	menuModel     MenuModel
@@ -37,7 +41,6 @@ type AppModel struct {
 	boardModel    BoardModel
 	resultsModel  ResultsModel
 
-	// Channel for external events (room events, game events)
 	width  int
 	height int
 }
@@ -70,12 +73,6 @@ func pollRoomEvents() tea.Msg {
 func pollGameEvents() tea.Msg {
 	time.Sleep(100 * time.Millisecond)
 	return PollGameEventsMsg{}
-}
-
-func tickTimer() tea.Cmd {
-	return tea.Tick(time.Second, func(t time.Time) tea.Msg {
-		return TimerTickMsg{}
-	})
 }
 
 func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -145,6 +142,7 @@ func (m AppModel) updateMenu(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.room = room
 		m.roomCode = code
 		m.isCreator = true
+		m.roomEvents = room.SubscribeRoomEvents(m.playerID)
 		m.screen = ScreenWaiting
 		m.waitingModel = NewWaitingModel(code, room.GetPlayerNicknames(), true)
 		return m, func() tea.Msg { return PollRoomEventsMsg{} }
@@ -159,6 +157,7 @@ func (m AppModel) updateMenu(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.room = room
 		m.roomCode = code
 		m.isCreator = false
+		m.roomEvents = room.SubscribeRoomEvents(m.playerID)
 		m.screen = ScreenWaiting
 		m.waitingModel = NewWaitingModel(code, room.GetPlayerNicknames(), false)
 		return m, func() tea.Msg { return PollRoomEventsMsg{} }
@@ -170,18 +169,25 @@ func (m AppModel) updateMenu(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m AppModel) updateWaiting(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg.(type) {
 	case PollRoomEventsMsg:
-		// Check for room events
-		if m.room != nil {
+		if m.room == nil {
+			return m, nil
+		}
+
+		// Drain all available room events
+		for {
 			select {
-			case event := <-m.room.Events():
+			case event, ok := <-m.roomEvents:
+				if !ok {
+					return m, nil // Channel closed
+				}
 				switch event.Type {
 				case lobby.EventPlayerJoined, lobby.EventPlayerLeft:
 					m.waitingModel.UpdatePlayers(m.room.GetPlayerNicknames())
-					msg := PlayerJoinedMsg{
+					innerMsg := PlayerJoinedMsg{
 						Players: m.room.GetPlayerNicknames(),
 						Message: event.Message,
 					}
-					m.waitingModel, _ = m.waitingModel.Update(msg)
+					m.waitingModel, _ = m.waitingModel.Update(innerMsg)
 				case lobby.EventNewCreator:
 					m.isCreator = m.room.IsCreator(m.playerID)
 					m.waitingModel.SetCreator(m.isCreator)
@@ -189,11 +195,13 @@ func (m AppModel) updateWaiting(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return m.transitionToBoard()
 				}
 			default:
+				goto doneRoomEvents
 			}
 		}
+	doneRoomEvents:
 
-		// Check if game started by this client
-		if m.room != nil && m.room.GetState() == lobby.RoomPlaying {
+		// Fallback: check if game started (in case we missed the event)
+		if m.room.GetState() == lobby.RoomPlaying && m.room.Game != nil {
 			return m.transitionToBoard()
 		}
 
@@ -217,57 +225,64 @@ func (m AppModel) updateWaiting(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m AppModel) transitionToBoard() (tea.Model, tea.Cmd) {
+	if m.screen == ScreenBoard {
+		// Already on board -- idempotent guard
+		return m, nil
+	}
+
 	m.screen = ScreenBoard
 	m.boardModel = NewBoardModel(m.playerID, m.nickname, m.room.Game)
 
-	// Start the game by rolling dice
-	m.room.Game.RollDice()
+	// Subscribe to game events (per-player channel)
+	m.gameEvents = m.room.Game.Subscribe(m.playerID)
+
+	// Don't call RollDice -- the game loop goroutine handles that
 	m.boardModel.ResetSubmission()
 
-	return m, tea.Batch(
-		func() tea.Msg { return PollGameEventsMsg{} },
-		tickTimer(),
-	)
+	return m, func() tea.Msg { return PollGameEventsMsg{} }
 }
 
 func (m AppModel) updateBoard(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg.(type) {
 	case PollGameEventsMsg:
-		if m.room != nil && m.room.Game != nil {
-			g := m.room.Game
+		if m.room == nil || m.room.Game == nil {
+			return m, nil
+		}
+
+		g := m.room.Game
+		needsRefresh := false
+
+		// Drain all available game events
+		for {
 			select {
-			case event := <-g.Events:
-				m.boardModel, _ = m.boardModel.Update(GameStateUpdatedMsg{Message: event.Message})
+			case event, ok := <-m.gameEvents:
+				if !ok {
+					return m, nil // Channel closed
+				}
+				if event.Message != "" {
+					m.boardModel.AddMessage(event.Message)
+				}
+				needsRefresh = true
 
 				if event.Type == game.EventGameOver {
 					return m.transitionToResults()
 				}
 			default:
-			}
-
-			// Check if game is over
-			if g.GetPhase() == game.PhaseGameOver {
-				return m.transitionToResults()
+				goto doneGameEvents
 			}
 		}
+	doneGameEvents:
+
+		if needsRefresh {
+			m.boardModel.RefreshFromGame()
+		}
+
+		// Fallback: check game over
+		if g.GetPhase() == game.PhaseGameOver {
+			return m.transitionToResults()
+		}
+
 		return m, func() tea.Msg { return PollGameEventsMsg{} }
-
-	case TimerTickMsg:
-		if m.room != nil && m.room.Game != nil {
-			g := m.room.Game
-			remaining := g.DecrementTimer()
-			m.boardModel, _ = m.boardModel.Update(msg)
-
-			if remaining <= 0 {
-				switch g.GetPhase() {
-				case game.PhaseWhiteSum:
-					g.AutoPassPhase1()
-				case game.PhaseColorCombo:
-					g.AutoPassPhase2()
-				}
-			}
-		}
-		return m, tickTimer()
 	}
 
 	var cmd tea.Cmd
@@ -283,17 +298,9 @@ func (m AppModel) updateBoard(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if err != nil {
 				m.boardModel.SetStatusMsg(fmt.Sprintf("Error: %v", err))
 				m.boardModel.ResetSubmission()
-			}
-
-			// Check if we transitioned to Phase 2 and need to handle it
-			newPhase := g.GetPhase()
-			if newPhase == game.PhaseColorCombo {
-				m.boardModel.ResetSubmission()
-			}
-			if newPhase == game.PhaseRolling {
-				// New turn - roll dice
-				g.RollDice()
-				m.boardModel.ResetSubmission()
+			} else {
+				// Move accepted; the game engine handles phase transitions and dice rolling
+				m.boardModel.RefreshFromGame()
 			}
 
 		case game.PhaseColorCombo:
@@ -301,16 +308,12 @@ func (m AppModel) updateBoard(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if err != nil {
 				m.boardModel.SetStatusMsg(fmt.Sprintf("Error: %v", err))
 				m.boardModel.ResetSubmission()
-			}
-
-			newPhase := g.GetPhase()
-			if newPhase == game.PhaseGameOver {
-				return m.transitionToResults()
-			}
-
-			if newPhase == game.PhaseRolling {
-				g.RollDice()
-				m.boardModel.ResetSubmission()
+			} else {
+				// Check if game ended
+				if g.GetPhase() == game.PhaseGameOver {
+					return m.transitionToResults()
+				}
+				m.boardModel.RefreshFromGame()
 			}
 		}
 	}
@@ -319,9 +322,12 @@ func (m AppModel) updateBoard(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m AppModel) transitionToResults() (tea.Model, tea.Cmd) {
+	if m.screen == ScreenResults {
+		return m, nil // Already on results
+	}
+
 	m.room.MarkFinished()
 	scores := m.room.Game.GetScores()
-
 	reason := m.room.Game.GetGameOverReason()
 
 	m.screen = ScreenResults
@@ -354,4 +360,17 @@ func (m AppModel) PlayerID() string {
 // RoomCode returns the current room code for cleanup.
 func (m AppModel) RoomCode() string {
 	return m.roomCode
+}
+
+// Cleanup unsubscribes from events and removes from room.
+func (m AppModel) Cleanup() {
+	if m.room != nil {
+		m.room.UnsubscribeRoomEvents(m.playerID)
+		if m.room.Game != nil {
+			m.room.Game.Unsubscribe(m.playerID)
+		}
+	}
+	if m.roomCode != "" {
+		m.lobby.RemovePlayer(m.roomCode, m.playerID)
+	}
 }

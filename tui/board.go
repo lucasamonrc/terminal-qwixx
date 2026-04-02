@@ -47,18 +47,6 @@ func (m BoardModel) Update(msg tea.Msg) (BoardModel, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		return m.handleKey(msg)
-
-	case GameStateUpdatedMsg:
-		if msg.Message != "" {
-			m.messages = append(m.messages, msg.Message)
-			if len(m.messages) > 5 {
-				m.messages = m.messages[1:]
-			}
-		}
-		m.refreshMoves()
-
-	case TimerTickMsg:
-		// Timer display is handled by reading gameState.GetTimeRemaining()
 	}
 
 	return m, nil
@@ -70,28 +58,25 @@ func (m BoardModel) handleKey(msg tea.KeyMsg) (BoardModel, tea.Cmd) {
 		return m, tea.Quit
 	}
 
-	if m.submitted || len(m.validMoves) == 0 {
-		// Check for pass
-		switch msg.String() {
-		case "p", "P":
-			if !m.submitted && m.canAct() {
-				m.submitted = true
-				m.chosenMove = nil
-			}
-		}
+	// Clear status message on any keypress
+	m.statusMsg = ""
+
+	if m.submitted {
+		return m, nil
+	}
+
+	if !m.canAct() {
 		return m, nil
 	}
 
 	switch msg.String() {
 	case "p", "P":
-		if m.canAct() {
-			m.submitted = true
-			m.chosenMove = nil
-		}
+		m.submitted = true
+		m.chosenMove = nil
 
 	case "1", "2", "3", "4", "5", "6", "7", "8", "9":
 		idx := int(msg.String()[0]-'0') - 1
-		if idx < len(m.validMoves) && m.canAct() {
+		if idx < len(m.validMoves) {
 			m.selectedMove = idx
 			m.submitted = true
 			move := m.validMoves[idx]
@@ -107,7 +92,7 @@ func (m BoardModel) handleKey(msg tea.KeyMsg) (BoardModel, tea.Cmd) {
 			m.selectedMove++
 		}
 	case "enter":
-		if m.canAct() && m.selectedMove < len(m.validMoves) {
+		if m.selectedMove < len(m.validMoves) {
 			m.submitted = true
 			move := m.validMoves[m.selectedMove]
 			m.chosenMove = &move
@@ -144,10 +129,16 @@ func (m BoardModel) View() string {
 	b.WriteString(m.renderPlayers())
 	b.WriteString("\n")
 
+	// Status message (errors from failed moves)
+	if m.statusMsg != "" {
+		b.WriteString(ErrorStyle.Render("  "+m.statusMsg))
+		b.WriteString("\n")
+	}
+
 	// Messages
 	if len(m.messages) > 0 {
 		for _, msg := range m.messages {
-			b.WriteString(StatusStyle.Render(msg))
+			b.WriteString(StatusStyle.Render("  " + msg))
 			b.WriteString("\n")
 		}
 		b.WriteString("\n")
@@ -191,7 +182,7 @@ func (m BoardModel) timerStyle(seconds int) lipgloss.Style {
 }
 
 func (m BoardModel) renderDice() string {
-	roll := m.gameState.GetCurrentRoll()
+	roll := m.gameState.GetCurrentRollSnapshot()
 
 	if roll == nil {
 		return SubtitleStyle.Render("  Rolling dice...")
@@ -223,14 +214,13 @@ func (m BoardModel) renderDice() string {
 }
 
 func (m BoardModel) renderScorecard() string {
-	g := m.gameState
-	players := g.GetPlayers()
-	lockedRows := g.GetLockedRows()
+	snapshots := m.gameState.GetPlayerSnapshots()
+	lockedRows := m.gameState.GetLockedRows()
 
-	var player *game.PlayerState
-	for _, p := range players {
-		if p.ID == m.playerID {
-			player = p
+	var player *game.PlayerSnapshot
+	for i := range snapshots {
+		if snapshots[i].ID == m.playerID {
+			player = &snapshots[i]
 			break
 		}
 	}
@@ -241,13 +231,13 @@ func (m BoardModel) renderScorecard() string {
 
 	var rows []string
 	for _, c := range game.AllColors {
-		rows = append(rows, m.renderRow(player.Scorecard, c, lockedRows))
+		rows = append(rows, m.renderRow(player, c, lockedRows))
 	}
 
 	return strings.Join(rows, "\n")
 }
 
-func (m BoardModel) renderRow(sc *game.Scorecard, c game.Color, lockedRows map[game.Color]string) string {
+func (m BoardModel) renderRow(player *game.PlayerSnapshot, c game.Color, lockedRows map[game.Color]string) string {
 	nums := game.RowNumbers(c)
 	_, isLocked := lockedRows[c]
 
@@ -262,7 +252,7 @@ func (m BoardModel) renderRow(sc *game.Scorecard, c game.Color, lockedRows map[g
 		numStr := fmt.Sprintf("%2d", n)
 		if isLocked {
 			numStrs = append(numStrs, LockedStyle.Render(numStr))
-		} else if sc.IsMarked(c, n) {
+		} else if player.Marks[c][n] {
 			numStrs = append(numStrs, markedStyle.Render(numStr))
 		} else {
 			numStrs = append(numStrs, DimStyle.Render(numStr))
@@ -273,8 +263,6 @@ func (m BoardModel) renderRow(sc *game.Scorecard, c game.Color, lockedRows map[g
 	lockStr := " "
 	if isLocked {
 		lockStr = LockedStyle.Render("LOCKED")
-	} else if sc.CanLock(c) {
-		lockStr = colorStyle.Render("LOCK!")
 	}
 
 	return label + " " + strings.Join(numStrs, " ") + "  " + lockStr
@@ -296,12 +284,12 @@ func (m BoardModel) getColorStyles(c game.Color) (lipgloss.Style, lipgloss.Style
 }
 
 func (m BoardModel) renderPenalties() string {
-	players := m.gameState.GetPlayers()
+	snapshots := m.gameState.GetPlayerSnapshots()
 
-	var player *game.PlayerState
-	for _, p := range players {
-		if p.ID == m.playerID {
-			player = p
+	var player *game.PlayerSnapshot
+	for i := range snapshots {
+		if snapshots[i].ID == m.playerID {
+			player = &snapshots[i]
 			break
 		}
 	}
@@ -312,7 +300,7 @@ func (m BoardModel) renderPenalties() string {
 
 	var boxes []string
 	for i := 0; i < 4; i++ {
-		if i < player.Scorecard.Penalties {
+		if i < player.Penalties {
 			boxes = append(boxes, PenaltyBoxFilled)
 		} else {
 			boxes = append(boxes, PenaltyBoxEmpty)
@@ -323,21 +311,21 @@ func (m BoardModel) renderPenalties() string {
 }
 
 func (m BoardModel) renderPlayers() string {
-	players := m.gameState.GetPlayers()
+	snapshots := m.gameState.GetPlayerSnapshots()
 	activeID := m.gameState.GetActivePlayerID()
 
 	var parts []string
-	for _, p := range players {
+	for _, p := range snapshots {
 		name := p.Nickname
 		if p.ID == m.playerID {
-			name += "(you)"
+			name += " (you)"
 		}
 		if !p.Connected {
-			name += SubtitleStyle.Render("(dc)")
+			name += SubtitleStyle.Render(" (dc)")
 		}
 		penStr := ""
-		if p.Scorecard.Penalties > 0 {
-			penStr = ErrorStyle.Render(fmt.Sprintf("[%d]", p.Scorecard.Penalties))
+		if p.Penalties > 0 {
+			penStr = ErrorStyle.Render(fmt.Sprintf("[%d]", p.Penalties))
 		}
 		if p.ID == activeID {
 			parts = append(parts, HighlightStyle.Render(name)+penStr)
@@ -361,6 +349,9 @@ func (m BoardModel) renderInput() string {
 			activeNick := m.gameState.GetActivePlayerNickname()
 			return SubtitleStyle.Render(fmt.Sprintf("  Waiting for %s to pick a color combo...", activeNick))
 		}
+		if phase == game.PhaseRolling {
+			return SubtitleStyle.Render("  Waiting for dice roll...")
+		}
 		return SubtitleStyle.Render("  Waiting...")
 	}
 
@@ -381,7 +372,7 @@ func (m BoardModel) renderInput() string {
 	b.WriteString("  ")
 	b.WriteString(SubtitleStyle.Render("p) Pass"))
 	b.WriteString("\n\n")
-	b.WriteString(SubtitleStyle.Render("  Select a move or pass"))
+	b.WriteString(SubtitleStyle.Render("  Select a move or press P to pass"))
 
 	return b.String()
 }
@@ -433,7 +424,20 @@ func (m *BoardModel) ResetSubmission() {
 	m.refreshMoves()
 }
 
-// SetStatusMsg sets a status message.
+// RefreshFromGame refreshes moves and submission state from the current game state.
+func (m *BoardModel) RefreshFromGame() {
+	m.refreshMoves()
+}
+
+// SetStatusMsg sets a status message (displayed as error).
 func (m *BoardModel) SetStatusMsg(msg string) {
 	m.statusMsg = msg
+}
+
+// AddMessage adds a notification message.
+func (m *BoardModel) AddMessage(msg string) {
+	m.messages = append(m.messages, msg)
+	if len(m.messages) > 5 {
+		m.messages = m.messages[1:]
+	}
 }

@@ -42,6 +42,7 @@ func (s *Server) Start() error {
 		wish.WithAddress(fmt.Sprintf("%s:%d", s.host, s.port)),
 		wish.WithHostKeyPath(".ssh/host_key"),
 		wish.WithMiddleware(
+			s.cleanupMiddleware(),
 			bm.Middleware(s.teaHandler),
 		),
 	)
@@ -71,9 +72,39 @@ func (s *Server) Start() error {
 }
 
 func (s *Server) teaHandler(sess ssh.Session) (tea.Model, []tea.ProgramOption) {
-	playerID := fmt.Sprintf("player_%d_%d", time.Now().UnixNano(), playerCounter.Add(1))
+	playerID := sess.Context().Value(playerIDKey).(string)
 
 	model := tui.NewAppModel(playerID, s.lobby)
 
 	return model, []tea.ProgramOption{tea.WithAltScreen()}
 }
+
+// cleanupMiddleware returns a middleware that cleans up player state on disconnect.
+func (s *Server) cleanupMiddleware() wish.Middleware {
+	return func(next ssh.Handler) ssh.Handler {
+		return func(sess ssh.Session) {
+			playerID := fmt.Sprintf("player_%d_%d", time.Now().UnixNano(), playerCounter.Add(1))
+			sess.Context().SetValue(playerIDKey, playerID)
+
+			// Run the inner handler (bubbletea)
+			next(sess)
+
+			// Session ended -- clean up
+			// We need to figure out the room code. Since we stored the playerID
+			// in context, we can search the lobby for this player.
+			s.cleanupPlayer(playerID)
+		}
+	}
+}
+
+// cleanupPlayer removes a player from any room they're in.
+func (s *Server) cleanupPlayer(playerID string) {
+	// We need to find which room this player is in.
+	// This is a linear scan but rooms are few.
+	s.lobby.RemovePlayerByID(playerID)
+}
+
+// contextKey is a custom type for context keys.
+type contextKey string
+
+const playerIDKey contextKey = "playerID"

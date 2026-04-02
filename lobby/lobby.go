@@ -38,16 +38,11 @@ func (l *Lobby) CreateRoom(creatorID, nickname string) (*Room, string) {
 
 	code := l.generateCode()
 	room := &Room{
-		Code:    code,
-		State:   RoomWaiting,
-		Creator: creatorID,
-		Players: []*Player{
-			{
-				ID:       creatorID,
-				Nickname: nickname,
-			},
-		},
-		events: make(chan RoomEvent, 50),
+		Code:        code,
+		State:       RoomWaiting,
+		Creator:     creatorID,
+		Players:     []*Player{{ID: creatorID, Nickname: nickname}},
+		subscribers: make(map[string]chan RoomEvent),
 	}
 
 	l.rooms[code] = room
@@ -56,10 +51,10 @@ func (l *Lobby) CreateRoom(creatorID, nickname string) (*Room, string) {
 
 // JoinRoom adds a player to an existing room.
 func (l *Lobby) JoinRoom(code, playerID, nickname string) (*Room, error) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
+	l.mu.RLock()
 	room, ok := l.rooms[code]
+	l.mu.RUnlock()
+
 	if !ok {
 		return nil, fmt.Errorf("room %s not found", code)
 	}
@@ -80,6 +75,9 @@ func (l *Lobby) JoinRoom(code, playerID, nickname string) (*Room, error) {
 		if p.ID == playerID {
 			return nil, fmt.Errorf("you are already in this room")
 		}
+		if p.Nickname == nickname {
+			return nil, fmt.Errorf("nickname '%s' is already taken in this room", nickname)
+		}
 	}
 
 	room.Players = append(room.Players, &Player{
@@ -87,7 +85,7 @@ func (l *Lobby) JoinRoom(code, playerID, nickname string) (*Room, error) {
 		Nickname: nickname,
 	})
 
-	room.emitEvent(RoomEvent{
+	room.broadcast(RoomEvent{
 		Type:    EventPlayerJoined,
 		Player:  nickname,
 		Message: fmt.Sprintf("%s joined the room", nickname),
@@ -106,14 +104,16 @@ func (l *Lobby) GetRoom(code string) *Room {
 // RemovePlayer removes a player from their room.
 // If the room is empty after removal, it's deleted.
 func (l *Lobby) RemovePlayer(code, playerID string) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
+	// First, look up the room under read lock
+	l.mu.RLock()
 	room, ok := l.rooms[code]
+	l.mu.RUnlock()
+
 	if !ok {
 		return
 	}
 
+	// Operate on the room without holding lobby lock
 	room.mu.Lock()
 
 	// Remove the player
@@ -126,37 +126,74 @@ func (l *Lobby) RemovePlayer(code, playerID string) {
 		}
 	}
 
-	if nickname != "" {
-		room.emitEvent(RoomEvent{
+	isEmpty := len(room.Players) == 0
+
+	if nickname != "" && !isEmpty {
+		room.broadcast(RoomEvent{
 			Type:    EventPlayerLeft,
 			Player:  nickname,
 			Message: fmt.Sprintf("%s left the room", nickname),
 		})
 	}
 
-	// If room is empty, delete it
-	if len(room.Players) == 0 {
-		room.mu.Unlock()
-		delete(l.rooms, code)
-		return
-	}
-
 	// If the creator left, assign to the next player
-	if room.Creator == playerID {
+	if !isEmpty && room.Creator == playerID {
 		room.Creator = room.Players[0].ID
-		room.emitEvent(RoomEvent{
+		room.broadcast(RoomEvent{
 			Type:    EventNewCreator,
 			Player:  room.Players[0].Nickname,
 			Message: fmt.Sprintf("%s is now the host", room.Players[0].Nickname),
 		})
 	}
 
-	// If game was in progress, notify the game engine
+	// Grab game reference before unlocking
+	var g *game.Game
 	if room.State == RoomPlaying && room.Game != nil {
-		room.Game.DisconnectPlayer(playerID)
+		g = room.Game
 	}
 
 	room.mu.Unlock()
+
+	// Notify game engine outside of room lock to avoid deadlock
+	if g != nil {
+		g.DisconnectPlayer(playerID)
+	}
+
+	// If room is empty, delete it under lobby write lock
+	if isEmpty {
+		l.mu.Lock()
+		// Double-check the room is still empty (race with concurrent join)
+		room.mu.RLock()
+		stillEmpty := len(room.Players) == 0
+		room.mu.RUnlock()
+		if stillEmpty {
+			delete(l.rooms, code)
+		}
+		l.mu.Unlock()
+	}
+}
+
+// RemovePlayerByID searches all rooms for a player and removes them.
+func (l *Lobby) RemovePlayerByID(playerID string) {
+	l.mu.RLock()
+	var foundCode string
+	for code, room := range l.rooms {
+		room.mu.RLock()
+		for _, p := range room.Players {
+			if p.ID == playerID {
+				foundCode = code
+				room.mu.RUnlock()
+				goto found
+			}
+		}
+		room.mu.RUnlock()
+	}
+found:
+	l.mu.RUnlock()
+
+	if foundCode != "" {
+		l.RemovePlayer(foundCode, playerID)
+	}
 }
 
 // DeleteRoom removes a room entirely.
@@ -169,7 +206,7 @@ func (l *Lobby) DeleteRoom(code string) {
 // generateCode generates a unique 4-character room code.
 func (l *Lobby) generateCode() string {
 	const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789" // Excluding I, O, 0, 1 to avoid confusion
-	for {
+	for attempts := 0; attempts < 1000; attempts++ {
 		code := make([]byte, RoomCodeLength)
 		for i := range code {
 			code[i] = chars[l.rng.Intn(len(chars))]
@@ -179,6 +216,8 @@ func (l *Lobby) generateCode() string {
 			return codeStr
 		}
 	}
+	// Fallback: extremely unlikely
+	return fmt.Sprintf("%04d", l.rng.Intn(10000))
 }
 
 // RoomState represents the state of a room.
@@ -198,7 +237,10 @@ type Room struct {
 	Creator string // Player ID of the room creator
 	Players []*Player
 	Game    *game.Game
-	events  chan RoomEvent
+
+	// Per-subscriber room event broadcast
+	subscriberMu sync.RWMutex
+	subscribers  map[string]chan RoomEvent
 }
 
 // Player represents a player in a room (lobby-level info).
@@ -224,6 +266,40 @@ const (
 	EventGameStarted
 	EventGameEnded
 )
+
+// SubscribeRoomEvents registers a player to receive room events.
+func (r *Room) SubscribeRoomEvents(playerID string) <-chan RoomEvent {
+	r.subscriberMu.Lock()
+	defer r.subscriberMu.Unlock()
+
+	ch := make(chan RoomEvent, 50)
+	r.subscribers[playerID] = ch
+	return ch
+}
+
+// UnsubscribeRoomEvents removes a player's room event subscription.
+func (r *Room) UnsubscribeRoomEvents(playerID string) {
+	r.subscriberMu.Lock()
+	defer r.subscriberMu.Unlock()
+
+	if ch, ok := r.subscribers[playerID]; ok {
+		close(ch)
+		delete(r.subscribers, playerID)
+	}
+}
+
+// broadcast sends an event to all room subscribers.
+func (r *Room) broadcast(event RoomEvent) {
+	r.subscriberMu.RLock()
+	defer r.subscriberMu.RUnlock()
+
+	for _, ch := range r.subscribers {
+		select {
+		case ch <- event:
+		default:
+		}
+	}
+}
 
 // StartGame starts the game in this room. Only the creator can start.
 func (r *Room) StartGame(playerID string) error {
@@ -255,7 +331,10 @@ func (r *Room) StartGame(playerID string) error {
 	r.Game = game.NewGame(playerStates, DefaultTimeout)
 	r.State = RoomPlaying
 
-	r.emitEvent(RoomEvent{
+	// Start the authoritative game loop (owns timer, auto-roll, auto-pass)
+	r.Game.StartGameLoop()
+
+	r.broadcast(RoomEvent{
 		Type:    EventGameStarted,
 		Message: "Game started!",
 	})
@@ -275,6 +354,19 @@ func (r *Room) ResetForNewGame(playerID string) error {
 	if r.State != RoomFinished {
 		return fmt.Errorf("current game is not finished")
 	}
+
+	// Remove disconnected players from the room
+	connected := make([]*Player, 0, len(r.Players))
+	for _, p := range r.Players {
+		// Check if the player is still subscribed (a proxy for connected)
+		r.subscriberMu.RLock()
+		_, subscribed := r.subscribers[p.ID]
+		r.subscriberMu.RUnlock()
+		if subscribed {
+			connected = append(connected, p)
+		}
+	}
+	r.Players = connected
 
 	r.Game = nil
 	r.State = RoomWaiting
@@ -306,18 +398,6 @@ func (r *Room) IsCreator(playerID string) bool {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.Creator == playerID
-}
-
-// Events returns the room event channel.
-func (r *Room) Events() <-chan RoomEvent {
-	return r.events
-}
-
-func (r *Room) emitEvent(event RoomEvent) {
-	select {
-	case r.events <- event:
-	default:
-	}
 }
 
 // MarkFinished marks the room as finished.

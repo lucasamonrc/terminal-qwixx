@@ -21,8 +21,8 @@ type ResultsModel struct {
 
 // NewResultsModel creates a new results screen.
 func NewResultsModel(scores []game.PlayerScore, reason string, isCreator bool, playerID string) ResultsModel {
-	// Sort by total score descending
-	sort.Slice(scores, func(i, j int) bool {
+	// Sort by total score descending (stable sort for consistent tie-breaking)
+	sort.SliceStable(scores, func(i, j int) bool {
 		return scores[i].Total > scores[j].Total
 	})
 
@@ -78,11 +78,11 @@ func (m ResultsModel) View() string {
 	// Player rows
 	for i, score := range m.scores {
 		name := score.Nickname
-		if score.PlayerID == m.playerID {
-			name += "(you)"
+		if len(name) > 10 {
+			name = name[:10]
 		}
-		if len(name) > 12 {
-			name = name[:12]
+		if score.PlayerID == m.playerID {
+			name += " (you)"
 		}
 
 		penaltyStr := fmt.Sprintf("-%d", score.Penalties*5)
