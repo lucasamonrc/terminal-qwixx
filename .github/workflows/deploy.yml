@@ -1,0 +1,61 @@
+name: Build, Test, and Deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Run tests
+        run: go test ./... -v -race
+
+  deploy:
+    name: Deploy
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Build for Linux
+        run: GOOS=linux GOARCH=amd64 go build -o qwixx .
+
+      - name: Deploy to VPS
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.VPS_SSH_KEY }}
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$SSH_PRIVATE_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H "$VPS_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+
+          # Copy binary to VPS
+          scp -i ~/.ssh/deploy_key ./qwixx "${VPS_USER}@${VPS_HOST}:/opt/qwixx/qwixx.new"
+
+          # Swap and restart on VPS
+          ssh -i ~/.ssh/deploy_key "${VPS_USER}@${VPS_HOST}" << 'EOF'
+            sudo mv /opt/qwixx/qwixx.new /opt/qwixx/qwixx
+            sudo chmod +x /opt/qwixx/qwixx
+            sudo systemctl restart qwixx
+            sleep 2
+            sudo systemctl is-active --quiet qwixx && echo "Deploy successful!" || (echo "Deploy failed!" && sudo journalctl -u qwixx --no-pager -n 20 && exit 1)
+          EOF
+
+          rm ~/.ssh/deploy_key

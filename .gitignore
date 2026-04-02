@@ -12,5 +12,6 @@ qwixx
 .DS_Store
 
 # SSH host keys (generated at runtime)
+.ssh/
 *.pem
 ssh_host_*
