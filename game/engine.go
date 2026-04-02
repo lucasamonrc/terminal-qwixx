@@ -439,6 +439,90 @@ type PlayerScore struct {
 	Total     int
 }
 
+// FindPlayerByID returns a player by ID (public accessor for TUI).
+func (g *Game) FindPlayerByID(playerID string) *PlayerState {
+	for _, p := range g.Players {
+		if p.ID == playerID {
+			return p
+		}
+	}
+	return nil
+}
+
+// GetPhase returns the current game phase (thread-safe).
+func (g *Game) GetPhase() GamePhase {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	return g.Phase
+}
+
+// GetGameOverReason returns the game over reason (thread-safe).
+func (g *Game) GetGameOverReason() string {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	return g.GameOverReason
+}
+
+// GetActivePlayerNickname returns the active player's nickname (thread-safe).
+func (g *Game) GetActivePlayerNickname() string {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	return g.Players[g.ActivePlayer].Nickname
+}
+
+// GetActivePlayerID returns the active player's ID (thread-safe).
+func (g *Game) GetActivePlayerID() string {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	return g.Players[g.ActivePlayer].ID
+}
+
+// GetTurnNumber returns the current turn number (thread-safe).
+func (g *Game) GetTurnNumber() int {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	return g.TurnNumber
+}
+
+// GetTimeRemaining returns the time remaining in seconds (thread-safe).
+func (g *Game) GetTimeRemaining() int {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	return g.TimeRemaining
+}
+
+// HasPlayerActedPhase1 checks if a player has acted in Phase 1 (thread-safe).
+func (g *Game) HasPlayerActedPhase1(playerID string) bool {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	return g.Phase1Actions[playerID]
+}
+
+// GetLockedRows returns a copy of the locked rows map (thread-safe).
+func (g *Game) GetLockedRows() map[Color]string {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	result := make(map[Color]string, len(g.LockedRows))
+	for k, v := range g.LockedRows {
+		result[k] = v
+	}
+	return result
+}
+
+// GetCurrentRoll returns the current dice roll (thread-safe).
+func (g *Game) GetCurrentRoll() *DiceRoll {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	return g.CurrentRoll
+}
+
+// GetPlayers returns the player list (thread-safe snapshot).
+func (g *Game) GetPlayers() []*PlayerState {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	return g.Players
+}
+
 // --- Internal helpers ---
 
 func (g *Game) findPlayer(playerID string) *PlayerState {
