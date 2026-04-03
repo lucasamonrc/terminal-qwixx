@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -25,6 +26,10 @@ type Server struct {
 	host  string
 	port  int
 	lobby *lobby.Lobby
+
+	// Track active sessions for cleanup on disconnect.
+	// Maps SSH session ID -> playerID
+	sessions sync.Map
 }
 
 // New creates a new game server.
@@ -72,7 +77,13 @@ func (s *Server) Start() error {
 }
 
 func (s *Server) teaHandler(sess ssh.Session) (tea.Model, []tea.ProgramOption) {
-	playerID := sess.Context().Value(playerIDKey).(string)
+	playerID := fmt.Sprintf("player_%d_%d", time.Now().UnixNano(), playerCounter.Add(1))
+
+	// Store the mapping so cleanup middleware can find it
+	sessionID := sess.Context().Value(ssh.ContextKeySessionID).(string)
+	s.sessions.Store(sessionID, playerID)
+
+	log.Printf("Player connected: %s (session: %s)", playerID, sessionID)
 
 	model := tui.NewAppModel(playerID, s.lobby)
 
@@ -83,28 +94,16 @@ func (s *Server) teaHandler(sess ssh.Session) (tea.Model, []tea.ProgramOption) {
 func (s *Server) cleanupMiddleware() wish.Middleware {
 	return func(next ssh.Handler) ssh.Handler {
 		return func(sess ssh.Session) {
-			playerID := fmt.Sprintf("player_%d_%d", time.Now().UnixNano(), playerCounter.Add(1))
-			sess.Context().SetValue(playerIDKey, playerID)
-
-			// Run the inner handler (bubbletea)
+			// Run the inner handler (bubbletea) -- blocks until session ends
 			next(sess)
 
 			// Session ended -- clean up
-			// We need to figure out the room code. Since we stored the playerID
-			// in context, we can search the lobby for this player.
-			s.cleanupPlayer(playerID)
+			sessionID := sess.Context().Value(ssh.ContextKeySessionID).(string)
+			if playerID, ok := s.sessions.LoadAndDelete(sessionID); ok {
+				pid := playerID.(string)
+				log.Printf("Player disconnected: %s (session: %s)", pid, sessionID)
+				s.lobby.RemovePlayerByID(pid)
+			}
 		}
 	}
 }
-
-// cleanupPlayer removes a player from any room they're in.
-func (s *Server) cleanupPlayer(playerID string) {
-	// We need to find which room this player is in.
-	// This is a linear scan but rooms are few.
-	s.lobby.RemovePlayerByID(playerID)
-}
-
-// contextKey is a custom type for context keys.
-type contextKey string
-
-const playerIDKey contextKey = "playerID"
