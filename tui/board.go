@@ -3,11 +3,15 @@ package tui
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/lucasacastro/qwixx/game"
 )
+
+// AutoPassMsg is sent after a delay to auto-pass when no valid moves exist.
+type AutoPassMsg struct{}
 
 type cursor struct {
 	row int // 0=Red, 1=Yellow, 2=Green, 3=Blue
@@ -24,9 +28,18 @@ type BoardModel struct {
 	statusMsg  string
 	messages   []string
 
+	// Player marks cache (for cursor skip logic)
+	playerMarks map[game.Color]map[int]bool
+
 	// Action tracking for the app layer
 	hasAction  bool
 	actionMove *game.Move // nil = pass
+
+	// Auto-pass state
+	autoPassPending bool
+
+	// Dice rolling animation
+	diceAnim DiceAnimation
 }
 
 func NewBoardModel(playerID, nickname string, gameState *game.Game) BoardModel {
@@ -46,6 +59,19 @@ func (m BoardModel) Update(msg tea.Msg) (BoardModel, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		return m.handleKey(msg)
+	case AutoPassMsg:
+		if m.autoPassPending {
+			m.autoPassPending = false
+			m.hasAction = true
+			m.actionMove = nil
+		}
+		return m, nil
+	case DiceAnimTickMsg:
+		if m.diceAnim.IsRunning() {
+			m.diceAnim.Tick()
+			return m, m.diceAnim.TickCmd()
+		}
+		return m, nil
 	}
 	return m, nil
 }
@@ -73,19 +99,17 @@ func (m BoardModel) handleKey(msg tea.KeyMsg) (BoardModel, tea.Cmd) {
 	case "up", "k":
 		if m.cursor.row > 0 {
 			m.cursor.row--
+			m.cursor.col = m.findNearestUnmarked(m.cursor.row, m.cursor.col, rows)
 		}
 	case "down", "j":
 		if m.cursor.row < 3 {
 			m.cursor.row++
+			m.cursor.col = m.findNearestUnmarked(m.cursor.row, m.cursor.col, rows)
 		}
 	case "left", "h":
-		if m.cursor.col > 0 {
-			m.cursor.col--
-		}
+		m.cursor.col = m.findNextUnmarked(m.cursor.row, m.cursor.col, -1, rows)
 	case "right", "l":
-		if m.cursor.col < len(rows[m.cursor.row])-1 {
-			m.cursor.col++
-		}
+		m.cursor.col = m.findNextUnmarked(m.cursor.row, m.cursor.col, 1, rows)
 	case "enter", " ":
 		c := colors[m.cursor.row]
 		num := rows[m.cursor.row][m.cursor.col]
@@ -99,6 +123,56 @@ func (m BoardModel) handleKey(msg tea.KeyMsg) (BoardModel, tea.Cmd) {
 	}
 
 	return m, nil
+}
+
+// isMarkedAt checks if the cell at the given row/col is marked.
+func (m BoardModel) isMarkedAt(row, col int, rows [][]int) bool {
+	if m.playerMarks == nil {
+		return false
+	}
+	c := game.AllColors[row]
+	num := rows[row][col]
+	return m.playerMarks[c][num]
+}
+
+// findNextUnmarked finds the next unmarked cell in the given direction (dir: -1 or +1).
+// Returns the new column index. If no unmarked cell exists in that direction, stays put.
+func (m BoardModel) findNextUnmarked(row, col, dir int, rows [][]int) int {
+	maxCol := len(rows[row]) - 1
+	next := col + dir
+	for next >= 0 && next <= maxCol {
+		if !m.isMarkedAt(row, next, rows) {
+			return next
+		}
+		next += dir
+	}
+	// No unmarked cell found in that direction, stay put
+	return col
+}
+
+// findNearestUnmarked finds the nearest unmarked cell to the target column on the given row.
+// Searches outward from targetCol (right first, then left). If none found, returns targetCol.
+func (m BoardModel) findNearestUnmarked(row, targetCol int, rows [][]int) int {
+	maxCol := len(rows[row]) - 1
+	if targetCol > maxCol {
+		targetCol = maxCol
+	}
+	if !m.isMarkedAt(row, targetCol, rows) {
+		return targetCol
+	}
+	// Search outward from targetCol
+	for offset := 1; offset <= maxCol; offset++ {
+		right := targetCol + offset
+		if right <= maxCol && !m.isMarkedAt(row, right, rows) {
+			return right
+		}
+		left := targetCol - offset
+		if left >= 0 && !m.isMarkedAt(row, left, rows) {
+			return left
+		}
+	}
+	// All cells marked, just stay at targetCol
+	return targetCol
 }
 
 func (m BoardModel) View() string {
@@ -178,27 +252,45 @@ func (m BoardModel) renderDice() string {
 		return SubtitleStyle.Render("  Rolling dice...")
 	}
 
-	step := m.gameState.GetPlayerStep(m.playerID)
-	isActive := m.gameState.IsActivePlayer(m.playerID)
+	animating := m.diceAnim.IsRunning()
+
+	// Helper to render a single die with the right style
+	renderDie := func(style lipgloss.Style, key diceKey, finalVal int) string {
+		if animating {
+			val := m.diceAnim.DisplayValue(key)
+			if m.diceAnim.IsSettled(key) {
+				return style.Render(fmt.Sprintf(" %d ", val))
+			}
+			return DiceRollingStyle.Inherit(style).Render(fmt.Sprintf(" %d ", val))
+		}
+		return style.Render(fmt.Sprintf(" %d ", finalVal))
+	}
 
 	var dice []string
-	dice = append(dice, WhiteDieStyle.Render(fmt.Sprintf(" %d ", roll.White1)))
-	dice = append(dice, WhiteDieStyle.Render(fmt.Sprintf(" %d ", roll.White2)))
+	dice = append(dice, renderDie(WhiteDieStyle, dkWhite1, roll.White1))
+	dice = append(dice, renderDie(WhiteDieStyle, dkWhite2, roll.White2))
 
 	if roll.ActiveColors[game.Red] {
-		dice = append(dice, RedDieStyle.Render(fmt.Sprintf(" %d ", roll.Red)))
+		dice = append(dice, renderDie(RedDieStyle, dkRed, roll.Red))
 	}
 	if roll.ActiveColors[game.Yellow] {
-		dice = append(dice, YellowDieStyle.Render(fmt.Sprintf(" %d ", roll.Yellow)))
+		dice = append(dice, renderDie(YellowDieStyle, dkYellow, roll.Yellow))
 	}
 	if roll.ActiveColors[game.Green] {
-		dice = append(dice, GreenDieStyle.Render(fmt.Sprintf(" %d ", roll.Green)))
+		dice = append(dice, renderDie(GreenDieStyle, dkGreen, roll.Green))
 	}
 	if roll.ActiveColors[game.Blue] {
-		dice = append(dice, BlueDieStyle.Render(fmt.Sprintf(" %d ", roll.Blue)))
+		dice = append(dice, renderDie(BlueDieStyle, dkBlue, roll.Blue))
 	}
 
 	diceRow := "  Dice:  " + strings.Join(dice, "  ")
+
+	if animating {
+		return diceRow + SubtitleStyle.Render("      Rolling...")
+	}
+
+	step := m.gameState.GetPlayerStep(m.playerID)
+	isActive := m.gameState.IsActivePlayer(m.playerID)
 
 	whiteSumStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#FFFFFF")).Background(lipgloss.Color("#555555")).Padding(0, 1)
 	whiteSum := fmt.Sprintf("      White sum = %s", whiteSumStyle.Render(fmt.Sprintf(" %d ", roll.WhiteSum())))
@@ -406,6 +498,40 @@ func (m *BoardModel) RefreshFromGame() {
 	}
 	m.hasAction = false
 	m.actionMove = nil
+
+	// Cache player marks for cursor skip logic
+	snapshots := m.gameState.GetPlayerSnapshots()
+	for _, s := range snapshots {
+		if s.ID == m.playerID {
+			m.playerMarks = s.Marks
+			break
+		}
+	}
+
+	// Check for auto-pass: if player has an actionable step but no valid moves
+	step := m.gameState.GetPlayerStep(m.playerID)
+	if (step == game.StepWhite || step == game.StepColor) && len(moves) == 0 {
+		m.autoPassPending = true
+		m.AddMessage("No valid moves — auto-passing...")
+	} else {
+		m.autoPassPending = false
+	}
+}
+
+// AutoPassCmd returns a tea.Cmd for the auto-pass delay if one is pending, or nil.
+func (m *BoardModel) AutoPassCmd() tea.Cmd {
+	if !m.autoPassPending {
+		return nil
+	}
+	return tea.Tick(1*time.Second, func(time.Time) tea.Msg {
+		return AutoPassMsg{}
+	})
+}
+
+// StartDiceAnimation starts the dice rolling animation for the given roll.
+func (m *BoardModel) StartDiceAnimation(roll *game.DiceRollSnapshot) tea.Cmd {
+	m.diceAnim = NewDiceAnimation(roll)
+	return m.diceAnim.TickCmd()
 }
 
 // SetStatusMsg sets a status message.

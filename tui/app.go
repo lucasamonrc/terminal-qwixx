@@ -233,6 +233,7 @@ func (m AppModel) updateBoard(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		g := m.room.Game
 		needsRefresh := false
+		diceRolled := false
 
 		for {
 			select {
@@ -245,6 +246,9 @@ func (m AppModel) updateBoard(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				needsRefresh = true
 
+				if event.Type == game.EventDiceRolled {
+					diceRolled = true
+				}
 				if event.Type == game.EventGameOver {
 					return m.transitionToResults()
 				}
@@ -262,7 +266,24 @@ func (m AppModel) updateBoard(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.transitionToResults()
 		}
 
-		return m, func() tea.Msg { return PollGameEventsMsg{} }
+		pollCmd := func() tea.Msg { return PollGameEventsMsg{} }
+		var cmds []tea.Cmd
+		cmds = append(cmds, pollCmd)
+
+		// Start dice animation if dice were just rolled
+		if diceRolled {
+			if roll := g.GetCurrentRollSnapshot(); roll != nil {
+				animCmd := m.boardModel.StartDiceAnimation(roll)
+				if animCmd != nil {
+					cmds = append(cmds, animCmd)
+				}
+			}
+		}
+
+		if autoCmd := m.boardModel.AutoPassCmd(); autoCmd != nil {
+			cmds = append(cmds, autoCmd)
+		}
+		return m, tea.Batch(cmds...)
 	}
 
 	var cmd tea.Cmd
@@ -290,6 +311,10 @@ func (m AppModel) updateBoard(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		if g.GetPhase() == game.PhaseGameOver {
 			return m.transitionToResults()
+		}
+
+		if autoCmd := m.boardModel.AutoPassCmd(); autoCmd != nil {
+			return m, tea.Batch(cmd, autoCmd)
 		}
 	}
 
@@ -327,8 +352,8 @@ func (m AppModel) updateResults(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
-func (m AppModel) PlayerID() string  { return m.playerID }
-func (m AppModel) RoomCode() string  { return m.roomCode }
+func (m AppModel) PlayerID() string { return m.playerID }
+func (m AppModel) RoomCode() string { return m.roomCode }
 
 func (m AppModel) Cleanup() {
 	if m.room != nil {

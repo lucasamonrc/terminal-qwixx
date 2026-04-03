@@ -52,6 +52,10 @@ var (
 			Bold(true).
 			Padding(0, 1)
 
+	// Dice rolling animation style (dimmer to indicate motion)
+	DiceRollingStyle = lipgloss.NewStyle().
+				Faint(true)
+
 	// UI elements
 	TitleStyle = lipgloss.NewStyle().
 			Bold(true).
