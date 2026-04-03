@@ -25,9 +25,9 @@ func (p GamePhase) String() string {
 	case PhaseRolling:
 		return "Rolling"
 	case PhaseWhiteSum:
-		return "White Sum"
+		return "All players: mark the white sum?"
 	case PhaseColorCombo:
-		return "Color Combo"
+		return "Active player: mark a color combo?"
 	case PhaseGameOver:
 		return "Game Over"
 	default:
@@ -60,7 +60,6 @@ const (
 	EventRowLocked
 	EventGameOver
 	EventPhaseChanged
-	EventTimerTick
 )
 
 // Game is the core game state machine.
@@ -81,10 +80,6 @@ type Game struct {
 	// (in either phase; if not, they get a penalty)
 	ActiveMarkedPhase1 bool
 	ActiveMarkedPhase2 bool
-
-	// Timer
-	TurnTimeout   time.Duration
-	TimeRemaining int // Seconds remaining
 
 	// RNG
 	rng *rand.Rand
@@ -109,8 +104,6 @@ func NewGame(players []*PlayerState, timeout time.Duration) *Game {
 		ActivePlayer:  0,
 		LockedRows:    make(map[Color]string),
 		Phase1Actions: make(map[string]bool),
-		TurnTimeout:   timeout,
-		TimeRemaining: int(timeout.Seconds()),
 		rng:           rand.New(rand.NewSource(time.Now().UnixNano())),
 		subscribers:   make(map[string]chan GameEvent),
 		TurnNumber:    1,
@@ -147,9 +140,9 @@ func (g *Game) Unsubscribe(playerID string) {
 	}
 }
 
-// StartGameLoop starts the authoritative game loop goroutine.
-// This goroutine owns the timer, auto-rolls dice, and handles timeouts.
-// Call this once after creating the game.
+// StartGameLoop starts the game loop goroutine.
+// With no timer, this just handles the initial dice roll and
+// auto-rolling when turns complete.
 func (g *Game) StartGameLoop() {
 	go g.gameLoop()
 }
@@ -171,7 +164,9 @@ func (g *Game) gameLoop() {
 	// Auto-roll dice at start
 	g.RollDice()
 
-	ticker := time.NewTicker(time.Second)
+	// Poll for PhaseRolling to auto-roll after turns complete.
+	// No timer -- players take as long as they want.
+	ticker := time.NewTicker(200 * time.Millisecond)
 	defer ticker.Stop()
 
 	for {
@@ -179,44 +174,16 @@ func (g *Game) gameLoop() {
 		case <-g.stopLoop:
 			return
 		case <-ticker.C:
-			g.mu.Lock()
-			if g.Phase == PhaseGameOver {
-				g.mu.Unlock()
+			g.mu.RLock()
+			phase := g.Phase
+			g.mu.RUnlock()
+
+			if phase == PhaseGameOver {
 				return
 			}
-
-			// Auto-roll when a turn completes normally (not just on timeout)
-			if g.Phase == PhaseRolling {
-				g.mu.Unlock()
+			if phase == PhaseRolling {
 				g.RollDice()
-				continue
 			}
-
-			if g.Phase == PhaseWhiteSum || g.Phase == PhaseColorCombo {
-				g.TimeRemaining--
-				if g.TimeRemaining <= 0 {
-					// Timeout - auto-pass
-					switch g.Phase {
-					case PhaseWhiteSum:
-						g.autoPassPhase1Locked()
-					case PhaseColorCombo:
-						g.autoPassPhase2Locked()
-					}
-
-					// After auto-pass, check if we need to roll
-					if g.Phase == PhaseRolling {
-						g.mu.Unlock()
-						g.RollDice()
-						continue
-					}
-				} else {
-					g.broadcast(GameEvent{
-						Type:    EventTimerTick,
-						Message: fmt.Sprintf("%ds remaining", g.TimeRemaining),
-					})
-				}
-			}
-			g.mu.Unlock()
 		}
 	}
 }
@@ -236,16 +203,11 @@ func (g *Game) RollDice() {
 	g.Phase1Actions = make(map[string]bool)
 	g.ActiveMarkedPhase1 = false
 	g.ActiveMarkedPhase2 = false
-	g.TimeRemaining = int(g.TurnTimeout.Seconds())
 
 	g.broadcast(GameEvent{
 		Type:    EventDiceRolled,
 		Player:  g.Players[g.ActivePlayer].Nickname,
 		Message: fmt.Sprintf("%s rolled the dice!", g.Players[g.ActivePlayer].Nickname),
-	})
-	g.broadcast(GameEvent{
-		Type:    EventPhaseChanged,
-		Message: "Phase 1: All players may mark the white sum",
 	})
 }
 
@@ -301,7 +263,6 @@ func (g *Game) SubmitPhase1Move(playerID string, move *Move) error {
 			return fmt.Errorf("Phase 1 move must use the white sum (%d)", g.CurrentRoll.WhiteSum())
 		}
 
-		// Validate the move
 		if !IsValidMove(player.Scorecard, move.Color, move.Number, g.LockedRows) {
 			return fmt.Errorf("invalid move")
 		}
@@ -403,6 +364,57 @@ func (g *Game) SubmitPhase2Move(playerID string, move *Move) error {
 
 	g.nextTurn()
 	return nil
+}
+
+// AutoPassPhase1 auto-passes all players who haven't acted in Phase 1.
+func (g *Game) AutoPassPhase1() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	if g.Phase != PhaseWhiteSum {
+		return
+	}
+
+	for _, p := range g.Players {
+		if p.Connected && !g.Phase1Actions[p.ID] {
+			g.Phase1Actions[p.ID] = true
+			g.broadcast(GameEvent{
+				Type:    EventPlayerPassed,
+				Player:  p.Nickname,
+				Message: fmt.Sprintf("%s auto-passed", p.Nickname),
+			})
+		}
+	}
+
+	g.transitionToPhase2()
+}
+
+// AutoPassPhase2 auto-passes the active player in Phase 2.
+func (g *Game) AutoPassPhase2() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	if g.Phase != PhaseColorCombo {
+		return
+	}
+
+	player := g.Players[g.ActivePlayer]
+
+	if !g.ActiveMarkedPhase1 && !g.ActiveMarkedPhase2 {
+		fourPenalties := player.Scorecard.AddPenalty()
+		g.broadcast(GameEvent{
+			Type:    EventPlayerPenalty,
+			Player:  player.Nickname,
+			Message: fmt.Sprintf("%s takes a penalty! (%d/4)", player.Nickname, player.Scorecard.Penalties),
+		})
+
+		if fourPenalties {
+			g.endGame(fmt.Sprintf("%s got 4 penalties!", player.Nickname))
+			return
+		}
+	}
+
+	g.nextTurn()
 }
 
 // DisconnectPlayer marks a player as disconnected.
@@ -519,13 +531,6 @@ func (g *Game) GetTurnNumber() int {
 	return g.TurnNumber
 }
 
-// GetTimeRemaining returns the time remaining in seconds (thread-safe).
-func (g *Game) GetTimeRemaining() int {
-	g.mu.RLock()
-	defer g.mu.RUnlock()
-	return g.TimeRemaining
-}
-
 // HasPlayerActedPhase1 checks if a player has acted in Phase 1 (thread-safe).
 func (g *Game) HasPlayerActedPhase1(playerID string) bool {
 	g.mu.RLock()
@@ -638,7 +643,6 @@ func (g *Game) allPlayersActed() bool {
 
 func (g *Game) transitionToPhase2() {
 	g.Phase = PhaseColorCombo
-	g.TimeRemaining = int(g.TurnTimeout.Seconds())
 
 	// Skip disconnected active player
 	if !g.Players[g.ActivePlayer].Connected {
@@ -655,7 +659,7 @@ func (g *Game) transitionToPhase2() {
 
 	g.broadcast(GameEvent{
 		Type:    EventPhaseChanged,
-		Message: fmt.Sprintf("Phase 2: %s may mark a white+color combo", g.Players[g.ActivePlayer].Nickname),
+		Message: fmt.Sprintf("%s: pick a white+color combo or pass", g.Players[g.ActivePlayer].Nickname),
 	})
 }
 
@@ -676,11 +680,10 @@ func (g *Game) nextTurn() {
 	}
 
 	g.Phase = PhaseRolling
-	g.TimeRemaining = int(g.TurnTimeout.Seconds())
 
 	g.broadcast(GameEvent{
 		Type:    EventPhaseChanged,
-		Message: fmt.Sprintf("Turn %d: %s's turn", g.TurnNumber, g.Players[g.ActivePlayer].Nickname),
+		Message: fmt.Sprintf("Turn %d: %s's turn to roll", g.TurnNumber, g.Players[g.ActivePlayer].Nickname),
 	})
 }
 
@@ -743,67 +746,6 @@ func (g *Game) broadcast(event GameEvent) {
 		select {
 		case ch <- event:
 		default:
-			// Drop if subscriber is full (shouldn't happen)
 		}
 	}
-}
-
-// AutoPassPhase1 auto-passes all players who haven't acted in Phase 1 (timeout).
-func (g *Game) AutoPassPhase1() {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	g.autoPassPhase1Locked()
-}
-
-// autoPassPhase1Locked auto-passes all players (must hold g.mu write lock).
-func (g *Game) autoPassPhase1Locked() {
-	if g.Phase != PhaseWhiteSum {
-		return
-	}
-
-	for _, p := range g.Players {
-		if p.Connected && !g.Phase1Actions[p.ID] {
-			g.Phase1Actions[p.ID] = true
-			g.broadcast(GameEvent{
-				Type:    EventPlayerPassed,
-				Player:  p.Nickname,
-				Message: fmt.Sprintf("%s auto-passed (timeout)", p.Nickname),
-			})
-		}
-	}
-
-	g.transitionToPhase2()
-}
-
-// AutoPassPhase2 auto-passes the active player in Phase 2 (timeout).
-func (g *Game) AutoPassPhase2() {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	g.autoPassPhase2Locked()
-}
-
-// autoPassPhase2Locked auto-passes the active player (must hold g.mu write lock).
-func (g *Game) autoPassPhase2Locked() {
-	if g.Phase != PhaseColorCombo {
-		return
-	}
-
-	player := g.Players[g.ActivePlayer]
-
-	// Penalty if nothing marked in either phase
-	if !g.ActiveMarkedPhase1 && !g.ActiveMarkedPhase2 {
-		fourPenalties := player.Scorecard.AddPenalty()
-		g.broadcast(GameEvent{
-			Type:    EventPlayerPenalty,
-			Player:  player.Nickname,
-			Message: fmt.Sprintf("%s takes a penalty (timeout)! (%d/4)", player.Nickname, player.Scorecard.Penalties),
-		})
-
-		if fourPenalties {
-			g.endGame(fmt.Sprintf("%s got 4 penalties!", player.Nickname))
-			return
-		}
-	}
-
-	g.nextTurn()
 }

@@ -178,7 +178,7 @@ func (m AppModel) updateWaiting(msg tea.Msg) (tea.Model, tea.Cmd) {
 			select {
 			case event, ok := <-m.roomEvents:
 				if !ok {
-					return m, nil // Channel closed
+					return m, nil
 				}
 				switch event.Type {
 				case lobby.EventPlayerJoined, lobby.EventPlayerLeft:
@@ -200,7 +200,6 @@ func (m AppModel) updateWaiting(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	doneRoomEvents:
 
-		// Fallback: check if game started (in case we missed the event)
 		if m.room.GetState() == lobby.RoomPlaying && m.room.Game != nil {
 			return m.transitionToBoard()
 		}
@@ -212,7 +211,6 @@ func (m AppModel) updateWaiting(msg tea.Msg) (tea.Model, tea.Cmd) {
 	m.waitingModel, cmd = m.waitingModel.Update(msg)
 
 	if m.waitingModel.Started() {
-		// Creator pressed start
 		err := m.room.StartGame(m.playerID)
 		if err != nil {
 			m.waitingModel.SetError(err.Error())
@@ -226,17 +224,12 @@ func (m AppModel) updateWaiting(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m AppModel) transitionToBoard() (tea.Model, tea.Cmd) {
 	if m.screen == ScreenBoard {
-		// Already on board -- idempotent guard
 		return m, nil
 	}
 
 	m.screen = ScreenBoard
 	m.boardModel = NewBoardModel(m.playerID, m.nickname, m.room.Game)
-
-	// Subscribe to game events (per-player channel)
 	m.gameEvents = m.room.Game.Subscribe(m.playerID)
-
-	// Don't call RollDice -- the game loop goroutine handles that
 	m.boardModel.ResetSubmission()
 
 	return m, func() tea.Msg { return PollGameEventsMsg{} }
@@ -257,7 +250,7 @@ func (m AppModel) updateBoard(msg tea.Msg) (tea.Model, tea.Cmd) {
 			select {
 			case event, ok := <-m.gameEvents:
 				if !ok {
-					return m, nil // Channel closed
+					return m, nil
 				}
 				if event.Message != "" {
 					m.boardModel.AddMessage(event.Message)
@@ -277,7 +270,6 @@ func (m AppModel) updateBoard(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.boardModel.RefreshFromGame()
 		}
 
-		// Fallback: check game over
 		if g.GetPhase() == game.PhaseGameOver {
 			return m.transitionToResults()
 		}
@@ -299,7 +291,6 @@ func (m AppModel) updateBoard(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.boardModel.SetStatusMsg(fmt.Sprintf("Error: %v", err))
 				m.boardModel.ResetSubmission()
 			} else {
-				// Move accepted; the game engine handles phase transitions and dice rolling
 				m.boardModel.RefreshFromGame()
 			}
 
@@ -309,7 +300,6 @@ func (m AppModel) updateBoard(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.boardModel.SetStatusMsg(fmt.Sprintf("Error: %v", err))
 				m.boardModel.ResetSubmission()
 			} else {
-				// Check if game ended
 				if g.GetPhase() == game.PhaseGameOver {
 					return m.transitionToResults()
 				}
@@ -323,7 +313,7 @@ func (m AppModel) updateBoard(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m AppModel) transitionToResults() (tea.Model, tea.Cmd) {
 	if m.screen == ScreenResults {
-		return m, nil // Already on results
+		return m, nil
 	}
 
 	m.room.MarkFinished()

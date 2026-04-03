@@ -94,4 +94,21 @@ var (
 	WinnerStyle = lipgloss.NewStyle().
 			Bold(true).
 			Foreground(lipgloss.Color("#FFDD44"))
+
+	// Cursor style for valid move under cursor
+	CursorValidStyle = lipgloss.NewStyle().
+				Background(lipgloss.Color("#FFFFFF")).
+				Foreground(lipgloss.Color("#000000")).
+				Bold(true)
+
+	// Cursor style for non-valid position
+	CursorInvalidStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("#888888")).
+				Reverse(true)
+
+	// Valid (selectable) number style
+	ValidMoveStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#FFFFFF")).
+			Bold(true).
+			Underline(true)
 )

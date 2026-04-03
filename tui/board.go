@@ -9,35 +9,34 @@ import (
 	"github.com/lucasacastro/qwixx/game"
 )
 
+// Cursor position on the scorecard.
+type cursor struct {
+	row int // 0=Red, 1=Yellow, 2=Green, 3=Blue
+	col int // 0-10 (index into the 11 numbers per row)
+}
+
 // BoardModel handles the main game board screen.
 type BoardModel struct {
-	playerID     string
-	nickname     string
-	gameState    *game.Game
-	validMoves   []game.Move
-	selectedMove int
-	statusMsg    string
-	messages     []string
-	submitted    bool
-	chosenMove   *game.Move // nil = pass
+	playerID   string
+	nickname   string
+	gameState  *game.Game
+	validMoves map[game.Color]map[int]bool // quick lookup: color -> number -> valid
+	cursor     cursor
+	statusMsg  string
+	messages   []string
+	submitted  bool
+	chosenMove *game.Move // nil = pass
 }
 
 // NewBoardModel creates a new game board screen.
 func NewBoardModel(playerID, nickname string, gameState *game.Game) BoardModel {
 	return BoardModel{
-		playerID:  playerID,
-		nickname:  nickname,
-		gameState: gameState,
+		playerID:   playerID,
+		nickname:   nickname,
+		gameState:  gameState,
+		validMoves: make(map[game.Color]map[int]bool),
 	}
 }
-
-// GameStateUpdatedMsg tells the board to refresh.
-type GameStateUpdatedMsg struct {
-	Message string
-}
-
-// TimerTickMsg is sent every second to update the timer.
-type TimerTickMsg struct{}
 
 func (m BoardModel) Init() tea.Cmd {
 	return nil
@@ -48,7 +47,6 @@ func (m BoardModel) Update(msg tea.Msg) (BoardModel, tea.Cmd) {
 	case tea.KeyMsg:
 		return m.handleKey(msg)
 	}
-
 	return m, nil
 }
 
@@ -58,45 +56,46 @@ func (m BoardModel) handleKey(msg tea.KeyMsg) (BoardModel, tea.Cmd) {
 		return m, tea.Quit
 	}
 
-	// Clear status message on any keypress
 	m.statusMsg = ""
 
-	if m.submitted {
+	if m.submitted || !m.canAct() {
 		return m, nil
 	}
 
-	if !m.canAct() {
-		return m, nil
+	colors := game.AllColors
+	rows := make([][]int, 4)
+	for i, c := range colors {
+		rows[i] = game.RowNumbers(c)
 	}
 
 	switch msg.String() {
+	case "up", "k":
+		if m.cursor.row > 0 {
+			m.cursor.row--
+		}
+	case "down", "j":
+		if m.cursor.row < 3 {
+			m.cursor.row++
+		}
+	case "left", "h":
+		if m.cursor.col > 0 {
+			m.cursor.col--
+		}
+	case "right", "l":
+		if m.cursor.col < len(rows[m.cursor.row])-1 {
+			m.cursor.col++
+		}
+	case "enter", " ":
+		// Try to select the number under the cursor
+		c := colors[m.cursor.row]
+		num := rows[m.cursor.row][m.cursor.col]
+		if m.validMoves[c] != nil && m.validMoves[c][num] {
+			m.submitted = true
+			m.chosenMove = &game.Move{Color: c, Number: num}
+		}
 	case "p", "P":
 		m.submitted = true
 		m.chosenMove = nil
-
-	case "1", "2", "3", "4", "5", "6", "7", "8", "9":
-		idx := int(msg.String()[0]-'0') - 1
-		if idx < len(m.validMoves) {
-			m.selectedMove = idx
-			m.submitted = true
-			move := m.validMoves[idx]
-			m.chosenMove = &move
-		}
-
-	case "up", "k":
-		if m.selectedMove > 0 {
-			m.selectedMove--
-		}
-	case "down", "j":
-		if m.selectedMove < len(m.validMoves)-1 {
-			m.selectedMove++
-		}
-	case "enter":
-		if m.selectedMove < len(m.validMoves) {
-			m.submitted = true
-			move := m.validMoves[m.selectedMove]
-			m.chosenMove = &move
-		}
 	}
 
 	return m, nil
@@ -109,108 +108,90 @@ func (m BoardModel) View() string {
 
 	var b strings.Builder
 
-	// Header
 	b.WriteString(m.renderHeader())
-	b.WriteString("\n")
-
-	// Dice
+	b.WriteString("\n\n")
 	b.WriteString(m.renderDice())
 	b.WriteString("\n\n")
-
-	// Scorecard
 	b.WriteString(m.renderScorecard())
 	b.WriteString("\n")
-
-	// Penalties
 	b.WriteString(m.renderPenalties())
 	b.WriteString("\n\n")
-
-	// Players
 	b.WriteString(m.renderPlayers())
-	b.WriteString("\n")
+	b.WriteString("\n\n")
 
-	// Status message (errors from failed moves)
 	if m.statusMsg != "" {
-		b.WriteString(ErrorStyle.Render("  "+m.statusMsg))
+		b.WriteString(ErrorStyle.Render("  " + m.statusMsg))
 		b.WriteString("\n")
 	}
 
-	// Messages
 	if len(m.messages) > 0 {
-		for _, msg := range m.messages {
+		for _, msg := range m.messages[max(0, len(m.messages)-3):] {
 			b.WriteString(StatusStyle.Render("  " + msg))
 			b.WriteString("\n")
 		}
-		b.WriteString("\n")
 	}
 
-	// Move selection / waiting
-	b.WriteString(m.renderInput())
+	b.WriteString("\n")
+	b.WriteString(m.renderControls())
 
 	return b.String()
 }
 
 func (m BoardModel) renderHeader() string {
 	g := m.gameState
-
 	activeNick := g.GetActivePlayerNickname()
-	phase := g.GetPhase().String()
-	timer := g.GetTimeRemaining()
+	phase := g.GetPhase()
 	turnNum := g.GetTurnNumber()
 
-	header := fmt.Sprintf(" Turn %d ", turnNum)
-	active := fmt.Sprintf(" %s's turn ", activeNick)
-	phaseStr := fmt.Sprintf(" %s ", phase)
-	timerStr := fmt.Sprintf(" %ds ", timer)
+	var phaseDesc string
+	switch phase {
+	case game.PhaseWhiteSum:
+		phaseDesc = "Everyone: mark the white sum?"
+	case game.PhaseColorCombo:
+		phaseDesc = fmt.Sprintf("%s: mark a color combo?", activeNick)
+	case game.PhaseRolling:
+		phaseDesc = "Rolling dice..."
+	default:
+		phaseDesc = phase.String()
+	}
 
 	return lipgloss.JoinHorizontal(lipgloss.Center,
-		TitleStyle.Render(header),
+		TitleStyle.Render(fmt.Sprintf(" Turn %d ", turnNum)),
 		"  ",
-		HighlightStyle.Render(active),
+		HighlightStyle.Render(fmt.Sprintf(" %s's turn ", activeNick)),
 		"  ",
-		SubtitleStyle.Render(phaseStr),
-		"  ",
-		m.timerStyle(timer).Render(timerStr),
+		SubtitleStyle.Render(phaseDesc),
 	)
-}
-
-func (m BoardModel) timerStyle(seconds int) lipgloss.Style {
-	if seconds <= 10 {
-		return ErrorStyle
-	}
-	return SubtitleStyle
 }
 
 func (m BoardModel) renderDice() string {
 	roll := m.gameState.GetCurrentRollSnapshot()
-
 	if roll == nil {
 		return SubtitleStyle.Render("  Rolling dice...")
 	}
 
 	var dice []string
-
-	dice = append(dice, WhiteDieStyle.Render(fmt.Sprintf("%d", roll.White1)))
-	dice = append(dice, WhiteDieStyle.Render(fmt.Sprintf("%d", roll.White2)))
+	dice = append(dice, WhiteDieStyle.Render(fmt.Sprintf(" %d ", roll.White1)))
+	dice = append(dice, WhiteDieStyle.Render(fmt.Sprintf(" %d ", roll.White2)))
 
 	if roll.ActiveColors[game.Red] {
-		dice = append(dice, RedDieStyle.Render(fmt.Sprintf("%d", roll.Red)))
+		dice = append(dice, RedDieStyle.Render(fmt.Sprintf(" %d ", roll.Red)))
 	}
 	if roll.ActiveColors[game.Yellow] {
-		dice = append(dice, YellowDieStyle.Render(fmt.Sprintf("%d", roll.Yellow)))
+		dice = append(dice, YellowDieStyle.Render(fmt.Sprintf(" %d ", roll.Yellow)))
 	}
 	if roll.ActiveColors[game.Green] {
-		dice = append(dice, GreenDieStyle.Render(fmt.Sprintf("%d", roll.Green)))
+		dice = append(dice, GreenDieStyle.Render(fmt.Sprintf(" %d ", roll.Green)))
 	}
 	if roll.ActiveColors[game.Blue] {
-		dice = append(dice, BlueDieStyle.Render(fmt.Sprintf("%d", roll.Blue)))
+		dice = append(dice, BlueDieStyle.Render(fmt.Sprintf(" %d ", roll.Blue)))
 	}
 
-	diceRow := "  " + strings.Join(dice, "  ")
+	diceRow := "  Dice:  " + strings.Join(dice, "  ")
+	whiteSum := fmt.Sprintf("      White sum = %s",
+		lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#FFFFFF")).Background(lipgloss.Color("#555555")).Padding(0, 1).Render(fmt.Sprintf(" %d ", roll.WhiteSum())))
 
-	whiteSum := fmt.Sprintf("  White sum: %s", HighlightStyle.Render(fmt.Sprintf("%d", roll.WhiteSum())))
-
-	return diceRow + "\n" + whiteSum
+	return diceRow + whiteSum
 }
 
 func (m BoardModel) renderScorecard() string {
@@ -224,48 +205,78 @@ func (m BoardModel) renderScorecard() string {
 			break
 		}
 	}
-
 	if player == nil {
 		return "Error: player not found"
 	}
 
+	canAct := m.canAct()
+
 	var rows []string
-	for _, c := range game.AllColors {
-		rows = append(rows, m.renderRow(player, c, lockedRows))
+	for rowIdx, c := range game.AllColors {
+		rows = append(rows, m.renderRow(player, c, lockedRows, rowIdx, canAct))
 	}
 
 	return strings.Join(rows, "\n")
 }
 
-func (m BoardModel) renderRow(player *game.PlayerSnapshot, c game.Color, lockedRows map[game.Color]string) string {
+func (m BoardModel) renderRow(player *game.PlayerSnapshot, c game.Color, lockedRows map[game.Color]string, rowIdx int, canAct bool) string {
 	nums := game.RowNumbers(c)
 	_, isLocked := lockedRows[c]
-
 	colorStyle, markedStyle := m.getColorStyles(c)
 
 	// Row label
-	label := colorStyle.Render(fmt.Sprintf("  %-4s", c.String()[:3]))
+	label := colorStyle.Render(fmt.Sprintf("  %-6s", c.String()))
+
+	// Selectable style for valid moves under cursor
+	cursorStyle := lipgloss.NewStyle().
+		Background(lipgloss.Color("#FFFFFF")).
+		Foreground(lipgloss.Color("#000000")).
+		Bold(true)
+
+	validStyle := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("#FFFFFF")).
+		Bold(true).
+		Underline(true)
 
 	// Numbers
 	var numStrs []string
-	for _, n := range nums {
+	for colIdx, n := range nums {
 		numStr := fmt.Sprintf("%2d", n)
+		isValid := m.validMoves[c] != nil && m.validMoves[c][n]
+		isCursor := canAct && m.cursor.row == rowIdx && m.cursor.col == colIdx
+
 		if isLocked {
 			numStrs = append(numStrs, LockedStyle.Render(numStr))
 		} else if player.Marks[c][n] {
 			numStrs = append(numStrs, markedStyle.Render(numStr))
+		} else if isCursor && isValid {
+			numStrs = append(numStrs, cursorStyle.Render(numStr))
+		} else if isCursor {
+			// Cursor on non-valid number
+			numStrs = append(numStrs, lipgloss.NewStyle().Foreground(lipgloss.Color("#888888")).Reverse(true).Render(numStr))
+		} else if isValid {
+			numStrs = append(numStrs, validStyle.Render(numStr))
 		} else {
 			numStrs = append(numStrs, DimStyle.Render(numStr))
 		}
 	}
 
 	// Lock indicator
-	lockStr := " "
+	lockStr := ""
 	if isLocked {
-		lockStr = LockedStyle.Render("LOCKED")
+		lockStr = "  " + LockedStyle.Render("LOCKED")
 	}
 
-	return label + " " + strings.Join(numStrs, " ") + "  " + lockStr
+	// Mark count
+	markCount := 0
+	for _, n := range nums {
+		if player.Marks[c][n] {
+			markCount++
+		}
+	}
+	countStr := SubtitleStyle.Render(fmt.Sprintf(" (%d)", markCount))
+
+	return label + strings.Join(numStrs, " ") + countStr + lockStr
 }
 
 func (m BoardModel) getColorStyles(c game.Color) (lipgloss.Style, lipgloss.Style) {
@@ -293,7 +304,6 @@ func (m BoardModel) renderPenalties() string {
 			break
 		}
 	}
-
 	if player == nil {
 		return ""
 	}
@@ -307,7 +317,7 @@ func (m BoardModel) renderPenalties() string {
 		}
 	}
 
-	return "  Penalties: " + strings.Join(boxes, "")
+	return "  Penalties: " + strings.Join(boxes, "") + SubtitleStyle.Render(fmt.Sprintf("  (-%d pts)", player.Penalties*5))
 }
 
 func (m BoardModel) renderPlayers() string {
@@ -325,29 +335,28 @@ func (m BoardModel) renderPlayers() string {
 		}
 		penStr := ""
 		if p.Penalties > 0 {
-			penStr = ErrorStyle.Render(fmt.Sprintf("[%d]", p.Penalties))
+			penStr = ErrorStyle.Render(fmt.Sprintf(" [%d]", p.Penalties))
 		}
 		if p.ID == activeID {
 			parts = append(parts, HighlightStyle.Render(name)+penStr)
 		} else {
-			parts = append(parts, name+penStr)
+			parts = append(parts, SubtitleStyle.Render(name)+penStr)
 		}
 	}
 
-	return "  Players: " + strings.Join(parts, " | ")
+	return "  Players: " + strings.Join(parts, "  |  ")
 }
 
-func (m BoardModel) renderInput() string {
+func (m BoardModel) renderControls() string {
 	if m.submitted {
 		return StatusStyle.Render("  Waiting for other players...")
 	}
 
 	if !m.canAct() {
 		phase := m.gameState.GetPhase()
-
 		if phase == game.PhaseColorCombo {
 			activeNick := m.gameState.GetActivePlayerNickname()
-			return SubtitleStyle.Render(fmt.Sprintf("  Waiting for %s to pick a color combo...", activeNick))
+			return SubtitleStyle.Render(fmt.Sprintf("  Waiting for %s...", activeNick))
 		}
 		if phase == game.PhaseRolling {
 			return SubtitleStyle.Render("  Waiting for dice roll...")
@@ -355,26 +364,7 @@ func (m BoardModel) renderInput() string {
 		return SubtitleStyle.Render("  Waiting...")
 	}
 
-	var b strings.Builder
-
-	if len(m.validMoves) > 0 {
-		for i, mv := range m.validMoves {
-			prefix := "  "
-			if i == m.selectedMove {
-				prefix = PromptStyle.Render("> ")
-			}
-			colorStyle, _ := m.getColorStyles(mv.Color)
-			label := fmt.Sprintf("%d) %s %d", i+1, colorStyle.Render(mv.Color.String()), mv.Number)
-			b.WriteString(prefix + label + "\n")
-		}
-	}
-
-	b.WriteString("  ")
-	b.WriteString(SubtitleStyle.Render("p) Pass"))
-	b.WriteString("\n\n")
-	b.WriteString(SubtitleStyle.Render("  Select a move or press P to pass"))
-
-	return b.String()
+	return SubtitleStyle.Render("  Arrow keys to move  |  Enter to mark  |  P to pass")
 }
 
 func (m BoardModel) canAct() bool {
@@ -393,16 +383,23 @@ func (m BoardModel) canAct() bool {
 
 func (m *BoardModel) refreshMoves() {
 	phase := m.gameState.GetPhase()
+	m.validMoves = make(map[game.Color]map[int]bool)
 
+	var moves []game.Move
 	switch phase {
 	case game.PhaseWhiteSum:
-		m.validMoves = m.gameState.GetValidMovesPhase1(m.playerID)
+		moves = m.gameState.GetValidMovesPhase1(m.playerID)
 	case game.PhaseColorCombo:
-		m.validMoves = m.gameState.GetValidMovesPhase2(m.playerID)
-	default:
-		m.validMoves = nil
+		moves = m.gameState.GetValidMovesPhase2(m.playerID)
 	}
-	m.selectedMove = 0
+
+	for _, mv := range moves {
+		if m.validMoves[mv.Color] == nil {
+			m.validMoves[mv.Color] = make(map[int]bool)
+		}
+		m.validMoves[mv.Color][mv.Number] = true
+	}
+
 	m.submitted = false
 	m.chosenMove = nil
 }
@@ -437,7 +434,14 @@ func (m *BoardModel) SetStatusMsg(msg string) {
 // AddMessage adds a notification message.
 func (m *BoardModel) AddMessage(msg string) {
 	m.messages = append(m.messages, msg)
-	if len(m.messages) > 5 {
-		m.messages = m.messages[1:]
+	if len(m.messages) > 10 {
+		m.messages = m.messages[len(m.messages)-10:]
 	}
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
