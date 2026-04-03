@@ -154,8 +154,12 @@ func (l *Lobby) RemovePlayer(code, playerID string) {
 
 	room.mu.Unlock()
 
+	// Unsubscribe from event channels
+	room.UnsubscribeRoomEvents(playerID)
+
 	// Notify game engine outside of room lock to avoid deadlock
 	if g != nil {
+		g.Unsubscribe(playerID)
 		g.DisconnectPlayer(playerID)
 	}
 

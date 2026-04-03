@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/lucasacastro/qwixx/lobby"
 )
 
 // WaitingModel handles the waiting room screen.
@@ -50,7 +51,7 @@ func (m WaitingModel) Update(msg tea.Msg) (WaitingModel, tea.Cmd) {
 	case tea.KeyMsg:
 		switch msg.Type {
 		case tea.KeyEnter:
-			if m.isCreator && len(m.players) >= MinPlayersToStart {
+			if m.isCreator && len(m.players) >= lobby.MinPlayersToStart {
 				m.started = true
 				return m, nil
 			}
@@ -76,7 +77,7 @@ func (m WaitingModel) Update(msg tea.Msg) (WaitingModel, tea.Cmd) {
 	return m, nil
 }
 
-const MinPlayersToStart = 2
+
 
 func (m WaitingModel) View() string {
 	var b strings.Builder
@@ -120,8 +121,8 @@ func (m WaitingModel) View() string {
 
 	// Action prompt
 	if m.isCreator {
-		if len(m.players) < MinPlayersToStart {
-			b.WriteString(SubtitleStyle.Render(fmt.Sprintf("Waiting for at least %d players to start...", MinPlayersToStart)))
+		if len(m.players) < lobby.MinPlayersToStart {
+			b.WriteString(SubtitleStyle.Render(fmt.Sprintf("Waiting for at least %d players to start...", lobby.MinPlayersToStart)))
 		} else {
 			b.WriteString(SuccessStyle.Render("Press Enter to start the game!"))
 		}

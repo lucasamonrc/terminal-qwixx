@@ -185,6 +185,13 @@ func (g *Game) gameLoop() {
 				return
 			}
 
+			// Auto-roll when a turn completes normally (not just on timeout)
+			if g.Phase == PhaseRolling {
+				g.mu.Unlock()
+				g.RollDice()
+				continue
+			}
+
 			if g.Phase == PhaseWhiteSum || g.Phase == PhaseColorCombo {
 				g.TimeRemaining--
 				if g.TimeRemaining <= 0 {

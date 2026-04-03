@@ -15,3 +15,6 @@ qwixx
 .ssh/
 *.pem
 ssh_host_*
+qwixx-server
+*.exp
+run_test.sh
