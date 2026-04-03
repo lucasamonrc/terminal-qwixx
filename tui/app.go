@@ -9,7 +9,6 @@ import (
 	"github.com/lucasacastro/qwixx/lobby"
 )
 
-// Screen represents the current screen in the app.
 type Screen int
 
 const (
@@ -20,7 +19,6 @@ const (
 	ScreenResults
 )
 
-// AppModel is the root Bubble Tea model that routes between screens.
 type AppModel struct {
 	screen    Screen
 	playerID  string
@@ -30,11 +28,9 @@ type AppModel struct {
 	room      *lobby.Room
 	isCreator bool
 
-	// Per-player event channels
 	roomEvents <-chan lobby.RoomEvent
 	gameEvents <-chan game.GameEvent
 
-	// Sub-models
 	nicknameModel NicknameModel
 	menuModel     MenuModel
 	waitingModel  WaitingModel
@@ -45,7 +41,6 @@ type AppModel struct {
 	height int
 }
 
-// NewAppModel creates a new root app model.
 func NewAppModel(playerID string, lob *lobby.Lobby) AppModel {
 	return AppModel{
 		screen:        ScreenNickname,
@@ -59,10 +54,7 @@ func (m AppModel) Init() tea.Cmd {
 	return m.nicknameModel.Init()
 }
 
-// PollRoomEventsMsg triggers polling for room events.
 type PollRoomEventsMsg struct{}
-
-// PollGameEventsMsg triggers polling for game events.
 type PollGameEventsMsg struct{}
 
 func pollRoomEvents() tea.Msg {
@@ -115,8 +107,6 @@ func (m AppModel) View() string {
 		return "Unknown screen"
 	}
 }
-
-// --- Screen update handlers ---
 
 func (m AppModel) updateNickname(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
@@ -173,7 +163,6 @@ func (m AppModel) updateWaiting(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 
-		// Drain all available room events
 		for {
 			select {
 			case event, ok := <-m.roomEvents:
@@ -230,7 +219,7 @@ func (m AppModel) transitionToBoard() (tea.Model, tea.Cmd) {
 	m.screen = ScreenBoard
 	m.boardModel = NewBoardModel(m.playerID, m.nickname, m.room.Game)
 	m.gameEvents = m.room.Game.Subscribe(m.playerID)
-	m.boardModel.ResetSubmission()
+	m.boardModel.RefreshFromGame()
 
 	return m, func() tea.Msg { return PollGameEventsMsg{} }
 }
@@ -245,7 +234,6 @@ func (m AppModel) updateBoard(msg tea.Msg) (tea.Model, tea.Cmd) {
 		g := m.room.Game
 		needsRefresh := false
 
-		// Drain all available game events
 		for {
 			select {
 			case event, ok := <-m.gameEvents:
@@ -280,31 +268,28 @@ func (m AppModel) updateBoard(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 	m.boardModel, cmd = m.boardModel.Update(msg)
 
-	// Check if the player submitted a move
-	if m.boardModel.Submitted() && m.room != nil && m.room.Game != nil {
+	// Check if the player performed an action
+	if m.boardModel.HasAction() && m.room != nil && m.room.Game != nil {
 		g := m.room.Game
+		move := m.boardModel.ActionMove()
+		m.boardModel.ConsumeAction()
 
-		switch g.GetPhase() {
-		case game.PhaseWhiteSum:
-			err := g.SubmitPhase1Move(m.playerID, m.boardModel.ChosenMove())
-			if err != nil {
-				m.boardModel.SetStatusMsg(fmt.Sprintf("Error: %v", err))
-				m.boardModel.ResetSubmission()
-			} else {
-				m.boardModel.RefreshFromGame()
-			}
+		var err error
+		if move != nil {
+			err = g.SubmitMark(m.playerID, *move)
+		} else {
+			err = g.SubmitPass(m.playerID)
+		}
 
-		case game.PhaseColorCombo:
-			err := g.SubmitPhase2Move(m.playerID, m.boardModel.ChosenMove())
-			if err != nil {
-				m.boardModel.SetStatusMsg(fmt.Sprintf("Error: %v", err))
-				m.boardModel.ResetSubmission()
-			} else {
-				if g.GetPhase() == game.PhaseGameOver {
-					return m.transitionToResults()
-				}
-				m.boardModel.RefreshFromGame()
-			}
+		if err != nil {
+			m.boardModel.SetStatusMsg(fmt.Sprintf("Error: %v", err))
+		}
+
+		// Refresh to show new state
+		m.boardModel.RefreshFromGame()
+
+		if g.GetPhase() == game.PhaseGameOver {
+			return m.transitionToResults()
 		}
 	}
 
@@ -342,17 +327,9 @@ func (m AppModel) updateResults(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
-// PlayerID returns the player ID for cleanup.
-func (m AppModel) PlayerID() string {
-	return m.playerID
-}
+func (m AppModel) PlayerID() string  { return m.playerID }
+func (m AppModel) RoomCode() string  { return m.roomCode }
 
-// RoomCode returns the current room code for cleanup.
-func (m AppModel) RoomCode() string {
-	return m.roomCode
-}
-
-// Cleanup unsubscribes from events and removes from room.
 func (m AppModel) Cleanup() {
 	if m.room != nil {
 		m.room.UnsubscribeRoomEvents(m.playerID)

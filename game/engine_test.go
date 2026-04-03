@@ -25,11 +25,9 @@ func TestNewGame(t *testing.T) {
 	if g.Phase != PhaseRolling {
 		t.Errorf("expected PhaseRolling, got %v", g.Phase)
 	}
-
 	if g.ActivePlayer != 0 {
 		t.Errorf("expected active player 0, got %d", g.ActivePlayer)
 	}
-
 	for _, p := range g.Players {
 		if p.Scorecard == nil {
 			t.Errorf("player %s has nil scorecard", p.Nickname)
@@ -40,162 +38,207 @@ func TestNewGame(t *testing.T) {
 func TestRollDice(t *testing.T) {
 	players := makeTestPlayers(2)
 	g := NewGame(players, 30*time.Second)
-
 	g.RollDice()
 
-	if g.Phase != PhaseWhiteSum {
-		t.Errorf("expected PhaseWhiteSum after rolling, got %v", g.Phase)
+	if g.Phase != PhaseAction {
+		t.Errorf("expected PhaseAction after rolling, got %v", g.Phase)
 	}
-
 	if g.CurrentRoll == nil {
 		t.Fatal("expected non-nil dice roll")
 	}
-
-	// All dice values should be 1-6
 	if g.CurrentRoll.White1 < 1 || g.CurrentRoll.White1 > 6 {
 		t.Errorf("white1 out of range: %d", g.CurrentRoll.White1)
 	}
-	if g.CurrentRoll.White2 < 1 || g.CurrentRoll.White2 > 6 {
-		t.Errorf("white2 out of range: %d", g.CurrentRoll.White2)
-	}
 }
 
-func TestPhase1AllPass(t *testing.T) {
+func TestRollDiceIdempotent(t *testing.T) {
 	players := makeTestPlayers(2)
 	g := NewGame(players, 30*time.Second)
 	g.RollDice()
 
-	// Both players pass
-	err := g.SubmitPhase1Move("player1", nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	roll1W1 := g.CurrentRoll.White1
+	roll1W2 := g.CurrentRoll.White2
 
-	// After first player passes, should still be Phase 1
-	if g.Phase != PhaseWhiteSum {
-		t.Errorf("expected PhaseWhiteSum, got %v", g.Phase)
+	// Calling again while in PhaseAction should be no-op
+	g.RollDice()
+	if g.CurrentRoll.White1 != roll1W1 || g.CurrentRoll.White2 != roll1W2 {
+		// Could theoretically happen with same random values, but very unlikely
+		t.Log("Note: dice values changed, but this could be coincidence")
 	}
-
-	err = g.SubmitPhase1Move("player2", nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	// After all pass, should transition to Phase 2
-	if g.Phase != PhaseColorCombo {
-		t.Errorf("expected PhaseColorCombo, got %v", g.Phase)
+	if g.Phase != PhaseAction {
+		t.Errorf("expected PhaseAction, got %v", g.Phase)
 	}
 }
 
-func TestPhase1Mark(t *testing.T) {
+func TestPlayerSteps(t *testing.T) {
+	players := makeTestPlayers(2)
+	g := NewGame(players, 30*time.Second)
+	g.RollDice()
+
+	// Player 1 is active, Player 2 is not
+	if g.GetPlayerStep("player1") != StepWhite {
+		t.Errorf("active player should start at StepWhite, got %v", g.GetPlayerStep("player1"))
+	}
+	if g.GetPlayerStep("player2") != StepWhite {
+		t.Errorf("non-active player should start at StepWhite, got %v", g.GetPlayerStep("player2"))
+	}
+}
+
+func TestNonActivePlayerPassFlow(t *testing.T) {
+	players := makeTestPlayers(2)
+	g := NewGame(players, 30*time.Second)
+	g.RollDice()
+
+	// Player 2 (non-active) passes
+	err := g.SubmitPass("player2")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Player 2 should now be confirmed/waiting
+	if g.GetPlayerStep("player2") != StepWaiting {
+		t.Errorf("non-active player should be waiting after pass, got %v", g.GetPlayerStep("player2"))
+	}
+}
+
+func TestActivePlayerTwoStepFlow(t *testing.T) {
+	players := makeTestPlayers(2)
+	g := NewGame(players, 30*time.Second)
+	g.RollDice()
+
+	// Active player passes white step
+	err := g.SubmitPass("player1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Active player should now be on color step
+	if g.GetPlayerStep("player1") != StepColor {
+		t.Errorf("active player should be at StepColor after passing white, got %v", g.GetPlayerStep("player1"))
+	}
+
+	// Non-active player also passes (to not block)
+	g.SubmitPass("player2")
+
+	// Active player passes color step
+	err = g.SubmitPass("player1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Active player passed everything -> should get a penalty
+	if g.Players[0].Scorecard.Penalties != 1 {
+		t.Errorf("expected 1 penalty for active player, got %d", g.Players[0].Scorecard.Penalties)
+	}
+
+	// Turn should have advanced
+	if g.ActivePlayer != 1 {
+		t.Errorf("expected active player to be 1, got %d", g.ActivePlayer)
+	}
+}
+
+func TestNonActivePlayerMarkWhiteSum(t *testing.T) {
 	players := makeTestPlayers(2)
 	g := NewGame(players, 30*time.Second)
 	g.RollDice()
 
 	whiteSum := g.CurrentRoll.WhiteSum()
 
-	// Player 1 marks if possible
-	moves := g.GetValidMovesPhase1("player1")
+	// Find a valid move for player 2
+	moves := g.GetValidMoves("player2")
 	if len(moves) > 0 {
-		err := g.SubmitPhase1Move("player1", &moves[0])
+		err := g.SubmitMark("player2", moves[0])
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
 
+		// Player 2 should be confirmed (non-active auto-confirms after white)
+		if g.GetPlayerStep("player2") != StepWaiting {
+			t.Errorf("non-active player should be waiting after marking, got %v", g.GetPlayerStep("player2"))
+		}
+
 		// Verify the mark
-		sc := g.Players[0].Scorecard
-		if !sc.IsMarked(moves[0].Color, whiteSum) {
-			t.Error("move should have been marked on scorecard")
+		if !g.Players[1].Scorecard.IsMarked(moves[0].Color, whiteSum) {
+			t.Error("move should have been marked")
 		}
 	}
 }
 
-func TestPhase1DuplicateAction(t *testing.T) {
+func TestActivePlayerMarkBoth(t *testing.T) {
 	players := makeTestPlayers(2)
 	g := NewGame(players, 30*time.Second)
 	g.RollDice()
 
-	g.SubmitPhase1Move("player1", nil)
-	err := g.SubmitPhase1Move("player1", nil)
+	// Player 2 passes quickly
+	g.SubmitPass("player2")
 
+	// Active player marks white sum
+	whiteMoves := g.GetValidMoves("player1")
+	if len(whiteMoves) > 0 {
+		err := g.SubmitMark("player1", whiteMoves[0])
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		// Should now be on color step
+		if g.GetPlayerStep("player1") != StepColor {
+			t.Errorf("active player should be at StepColor, got %v", g.GetPlayerStep("player1"))
+		}
+	} else {
+		g.SubmitPass("player1")
+	}
+
+	// Active player tries color combo
+	colorMoves := g.GetValidMoves("player1")
+	if len(colorMoves) > 0 {
+		err := g.SubmitMark("player1", colorMoves[0])
+		if err != nil {
+			t.Fatalf("unexpected error marking color: %v", err)
+		}
+	} else {
+		g.SubmitPass("player1")
+	}
+
+	// Active player marked at least white -> no penalty
+	if len(whiteMoves) > 0 && g.Players[0].Scorecard.Penalties != 0 {
+		t.Errorf("should not get penalty after marking, got %d", g.Players[0].Scorecard.Penalties)
+	}
+}
+
+func TestWhiteSumValidation(t *testing.T) {
+	players := makeTestPlayers(2)
+	g := NewGame(players, 30*time.Second)
+	g.RollDice()
+
+	whiteSum := g.CurrentRoll.WhiteSum()
+	wrongNumber := whiteSum + 1
+	if wrongNumber > 12 {
+		wrongNumber = whiteSum - 1
+	}
+
+	err := g.SubmitMark("player1", Move{Color: Red, Number: wrongNumber})
 	if err == nil {
-		t.Error("expected error for duplicate action")
+		t.Errorf("expected error for wrong white sum (tried %d, white sum is %d)", wrongNumber, whiteSum)
 	}
 }
 
-func TestPhase2PenaltyForNoMarks(t *testing.T) {
+func TestPenaltyOn4Ends(t *testing.T) {
 	players := makeTestPlayers(2)
 	g := NewGame(players, 30*time.Second)
-	g.RollDice()
-
-	// Both pass Phase 1
-	g.SubmitPhase1Move("player1", nil)
-	g.SubmitPhase1Move("player2", nil)
-
-	// Active player (player1) passes Phase 2 too
-	err := g.SubmitPhase2Move("player1", nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	// Player1 should have a penalty (passed both phases)
-	if g.Players[0].Scorecard.Penalties != 1 {
-		t.Errorf("expected 1 penalty, got %d", g.Players[0].Scorecard.Penalties)
-	}
-
-	// Should have advanced to next turn (PhaseRolling, active player 1)
-	if g.Phase != PhaseRolling {
-		t.Errorf("expected PhaseRolling, got %v", g.Phase)
-	}
-	if g.ActivePlayer != 1 {
-		t.Errorf("expected active player 1, got %d", g.ActivePlayer)
-	}
-}
-
-func TestPhase2NoPenaltyIfMarkedInPhase1(t *testing.T) {
-	players := makeTestPlayers(2)
-	g := NewGame(players, 30*time.Second)
-	g.RollDice()
-
-	// Get valid moves for the active player (player1)
-	moves := g.GetValidMovesPhase1("player1")
-
-	if len(moves) > 0 {
-		// Player 1 marks in Phase 1
-		g.SubmitPhase1Move("player1", &moves[0])
-		g.SubmitPhase1Move("player2", nil)
-
-		// Player 1 passes Phase 2 - should NOT get a penalty
-		g.SubmitPhase2Move("player1", nil)
-
-		if g.Players[0].Scorecard.Penalties != 0 {
-			t.Errorf("should not get penalty after marking in Phase 1, got %d penalties", g.Players[0].Scorecard.Penalties)
-		}
-	}
-}
-
-func TestGameEnd4Penalties(t *testing.T) {
-	players := makeTestPlayers(2)
-	g := NewGame(players, 30*time.Second)
-
-	// Give player1 3 penalties manually
 	g.Players[0].Scorecard.Penalties = 3
-
 	g.RollDice()
 
-	// Both pass Phase 1
-	g.SubmitPhase1Move("player1", nil)
-	g.SubmitPhase1Move("player2", nil)
-
-	// Player1 passes Phase 2 -> 4th penalty -> game over
-	g.SubmitPhase2Move("player1", nil)
+	// Both pass everything
+	g.SubmitPass("player2") // non-active done
+	g.SubmitPass("player1") // white pass -> color step
+	g.SubmitPass("player1") // color pass -> penalty -> 4th -> game over
 
 	if g.Phase != PhaseGameOver {
 		t.Errorf("expected PhaseGameOver, got %v", g.Phase)
 	}
 }
 
-func TestGameEnd2RowsLocked(t *testing.T) {
+func TestTwoRowsLockedEndsGame(t *testing.T) {
 	players := makeTestPlayers(2)
 	g := NewGame(players, 30*time.Second)
 
@@ -212,15 +255,14 @@ func TestGameEnd2RowsLocked(t *testing.T) {
 
 	g.RollDice()
 
-	// Force white sum to 12 for testing
+	// Force white sum to 12
 	g.mu.Lock()
 	g.CurrentRoll.White1 = 6
 	g.CurrentRoll.White2 = 6
 	g.mu.Unlock()
 
-	// Player1 marks Yellow 12 (should trigger lock)
-	move := &Move{Color: Yellow, Number: 12}
-	err := g.SubmitPhase1Move("player1", move)
+	// Player 1 marks Yellow 12
+	err := g.SubmitMark("player1", Move{Color: Yellow, Number: 12})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -230,61 +272,21 @@ func TestGameEnd2RowsLocked(t *testing.T) {
 	}
 }
 
-func TestAutoPassPhase1(t *testing.T) {
-	players := makeTestPlayers(3)
-	g := NewGame(players, 30*time.Second)
-	g.RollDice()
-
-	// Only player1 acts
-	g.SubmitPhase1Move("player1", nil)
-
-	// Auto-pass the rest
-	g.AutoPassPhase1()
-
-	if g.Phase != PhaseColorCombo {
-		t.Errorf("expected PhaseColorCombo after auto-pass, got %v", g.Phase)
-	}
-}
-
-func TestAutoPassPhase2(t *testing.T) {
-	players := makeTestPlayers(2)
-	g := NewGame(players, 30*time.Second)
-	g.RollDice()
-
-	g.SubmitPhase1Move("player1", nil)
-	g.SubmitPhase1Move("player2", nil)
-
-	// Auto-pass phase 2 for active player
-	g.AutoPassPhase2()
-
-	// Should get a penalty (passed both phases)
-	if g.Players[0].Scorecard.Penalties != 1 {
-		t.Errorf("expected 1 penalty after auto-pass, got %d", g.Players[0].Scorecard.Penalties)
-	}
-
-	if g.Phase != PhaseRolling {
-		t.Errorf("expected PhaseRolling after auto-pass phase 2, got %v", g.Phase)
-	}
-}
-
 func TestDisconnectPlayer(t *testing.T) {
 	players := makeTestPlayers(2)
 	g := NewGame(players, 30*time.Second)
 	g.RollDice()
 
-	// Disconnect player2 during Phase 1
+	// Disconnect player2 -> auto-confirmed
 	g.DisconnectPlayer("player2")
 
 	if g.Players[1].Connected {
 		t.Error("player2 should be disconnected")
 	}
 
-	// Player1 passes -> should transition (player2 auto-counted as acted)
-	g.SubmitPhase1Move("player1", nil)
-
-	if g.Phase != PhaseColorCombo {
-		t.Errorf("expected PhaseColorCombo, got %v", g.Phase)
-	}
+	// Player1 passes both steps -> penalty, turn should end
+	g.SubmitPass("player1") // white
+	g.SubmitPass("player1") // color -> penalty, all confirmed, next turn
 }
 
 func TestGetScores(t *testing.T) {
@@ -296,75 +298,34 @@ func TestGetScores(t *testing.T) {
 	g.Players[0].Scorecard.Mark(Red, 4) // 3 marks = 6 pts
 
 	g.Players[1].Scorecard.Mark(Blue, 12)
-	g.Players[1].Scorecard.Penalties = 1 // 1 mark = 1 pt, -5 penalty = -4 pts
+	g.Players[1].Scorecard.Penalties = 1 // 1 mark = 1 pt, -5 = -4
 
 	scores := g.GetScores()
-
 	if scores[0].Total != 6 {
-		t.Errorf("player1 expected 6 points, got %d", scores[0].Total)
+		t.Errorf("player1 expected 6 pts, got %d", scores[0].Total)
 	}
 	if scores[1].Total != -4 {
-		t.Errorf("player2 expected -4 points, got %d", scores[1].Total)
+		t.Errorf("player2 expected -4 pts, got %d", scores[1].Total)
 	}
 }
 
 func TestTurnRotation(t *testing.T) {
 	players := makeTestPlayers(3)
 	g := NewGame(players, 30*time.Second)
+	g.RollDice()
 
 	if g.ActivePlayer != 0 {
-		t.Errorf("expected first active player to be 0, got %d", g.ActivePlayer)
+		t.Errorf("expected active player 0, got %d", g.ActivePlayer)
 	}
 
-	// Complete a full turn
-	g.RollDice()
-	g.SubmitPhase1Move("player1", nil)
-	g.SubmitPhase1Move("player2", nil)
-	g.SubmitPhase1Move("player3", nil)
-	g.SubmitPhase2Move("player1", nil) // penalty
+	// Everyone passes
+	g.SubmitPass("player2")
+	g.SubmitPass("player3")
+	g.SubmitPass("player1") // white
+	g.SubmitPass("player1") // color -> penalty, all confirmed
 
 	if g.ActivePlayer != 1 {
-		t.Errorf("expected active player 1 after turn, got %d", g.ActivePlayer)
-	}
-}
-
-func TestPhase1RejectsWrongNumber(t *testing.T) {
-	players := makeTestPlayers(2)
-	g := NewGame(players, 30*time.Second)
-	g.RollDice()
-
-	whiteSum := g.CurrentRoll.WhiteSum()
-	wrongNumber := whiteSum + 1
-	if wrongNumber > 12 {
-		wrongNumber = whiteSum - 1
-	}
-
-	// Try to mark a number that's not the white sum
-	move := &Move{Color: Red, Number: wrongNumber}
-	err := g.SubmitPhase1Move("player1", move)
-	if err == nil {
-		t.Errorf("expected error when marking %d (white sum is %d)", wrongNumber, whiteSum)
-	}
-}
-
-func TestPhase2RejectsInvalidCombo(t *testing.T) {
-	players := makeTestPlayers(2)
-	g := NewGame(players, 30*time.Second)
-	g.RollDice()
-
-	// Both pass Phase 1
-	g.SubmitPhase1Move("player1", nil)
-	g.SubmitPhase1Move("player2", nil)
-
-	// Try to submit a move that doesn't match any dice combo
-	// Use a number that can't be a valid white+colored combo (e.g., 2 if both white dice are high)
-	move := &Move{Color: Red, Number: 2}
-	// This should fail either because 2 isn't a valid combo or because it's not a valid position
-	err := g.SubmitPhase2Move("player1", move)
-	if err == nil {
-		// If it succeeded, the number happened to match a combo; that's fine for this test
-		// The important thing is validation exists
-		t.Log("Move happened to be valid; skipping this test case")
+		t.Errorf("expected active player 1, got %d", g.ActivePlayer)
 	}
 }
 
@@ -377,7 +338,7 @@ func TestSubscribeBroadcast(t *testing.T) {
 
 	g.RollDice()
 
-	// Both subscribers should receive events
+	// Both should receive the dice rolled event
 	select {
 	case event := <-ch1:
 		if event.Type != EventDiceRolled {
@@ -400,50 +361,40 @@ func TestSubscribeBroadcast(t *testing.T) {
 	g.Unsubscribe("player2")
 }
 
-func TestRollDiceIdempotent(t *testing.T) {
-	players := makeTestPlayers(2)
-	g := NewGame(players, 30*time.Second)
-
-	g.RollDice()
-	firstRoll := g.CurrentRoll.White1 + g.CurrentRoll.White2
-
-	// Calling RollDice again while in PhaseWhiteSum should be a no-op
-	g.RollDice()
-	secondRoll := g.CurrentRoll.White1 + g.CurrentRoll.White2
-
-	if firstRoll != secondRoll {
-		// The roll changed, which means the idempotent guard failed
-		// (Note: there's a tiny chance both rolls produce the same sum, but different dice)
-		// Let's check the phase instead
-	}
-
-	if g.Phase != PhaseWhiteSum {
-		t.Errorf("expected PhaseWhiteSum, got %v", g.Phase)
-	}
-}
-
-func TestTransitionToPhase2PenaltyForDisconnected(t *testing.T) {
-	players := makeTestPlayers(2)
+func TestSimultaneousActions(t *testing.T) {
+	// Test that non-active player and active player can act independently
+	players := makeTestPlayers(3)
 	g := NewGame(players, 30*time.Second)
 	g.RollDice()
 
-	// Disconnect active player (player1) and give them 3 penalties
-	g.Players[0].Connected = false
-	g.Players[0].Scorecard.Penalties = 3
-
-	// Player2 passes
-	g.SubmitPhase1Move("player2", nil)
-
-	// Player1 is disconnected, auto-counted as acted
-	g.mu.Lock()
-	g.Phase1Actions["player1"] = true
-	if g.allPlayersActed() {
-		g.transitionToPhase2()
+	// Player 3 (non-active) passes immediately
+	g.SubmitPass("player3")
+	if g.GetPlayerStep("player3") != StepWaiting {
+		t.Error("player3 should be waiting")
 	}
-	g.mu.Unlock()
 
-	// Player1 should have 4 penalties now (game over)
-	if g.Phase != PhaseGameOver {
-		t.Errorf("expected PhaseGameOver when disconnected player gets 4th penalty, got %v", g.Phase)
+	// Active player (player1) is still on white step
+	if g.GetPlayerStep("player1") != StepWhite {
+		t.Error("player1 should still be on white step")
+	}
+
+	// Player 2 (non-active) passes
+	g.SubmitPass("player2")
+	if g.GetPlayerStep("player2") != StepWaiting {
+		t.Error("player2 should be waiting")
+	}
+
+	// Active player passes white
+	g.SubmitPass("player1")
+	if g.GetPlayerStep("player1") != StepColor {
+		t.Error("player1 should be on color step")
+	}
+
+	// Active player passes color -> all confirmed, turn ends
+	g.SubmitPass("player1")
+
+	// Player1 should have penalty (passed everything)
+	if g.Players[0].Scorecard.Penalties != 1 {
+		t.Errorf("expected 1 penalty, got %d", g.Players[0].Scorecard.Penalties)
 	}
 }

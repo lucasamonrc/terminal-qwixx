@@ -11,11 +11,10 @@ import (
 type GamePhase int
 
 const (
-	PhaseWaiting    GamePhase = iota // Waiting for players / game not started
-	PhaseRolling                     // About to roll dice
-	PhaseWhiteSum                    // Phase 1: all players can use white sum
-	PhaseColorCombo                  // Phase 2: active player picks white+colored combo
-	PhaseGameOver                    // Game has ended
+	PhaseWaiting  GamePhase = iota // Waiting for players / game not started
+	PhaseRolling                   // About to roll dice
+	PhaseAction                    // Everyone acts simultaneously on the roll
+	PhaseGameOver                  // Game has ended
 )
 
 func (p GamePhase) String() string {
@@ -24,16 +23,33 @@ func (p GamePhase) String() string {
 		return "Waiting"
 	case PhaseRolling:
 		return "Rolling"
-	case PhaseWhiteSum:
-		return "All players: mark the white sum?"
-	case PhaseColorCombo:
-		return "Active player: mark a color combo?"
+	case PhaseAction:
+		return "Action"
 	case PhaseGameOver:
 		return "Game Over"
 	default:
 		return "Unknown"
 	}
 }
+
+// PlayerAction tracks what a player has done this turn.
+type PlayerAction struct {
+	WhiteMarked bool  // Did they mark the white sum?
+	WhiteMove   *Move // The white sum move they made (nil if passed/skipped)
+	ColorMarked bool  // Did they mark a color combo? (active player only)
+	ColorMove   *Move // The color combo move (nil if passed/skipped)
+	Confirmed   bool  // Have they finished their turn?
+}
+
+// PlayerStep indicates what a player should do next.
+type PlayerStep int
+
+const (
+	StepWhite     PlayerStep = iota // Choose to mark white sum or skip
+	StepColor                       // Active player: choose color combo or skip
+	StepDone                        // Player is done for this turn
+	StepWaiting                     // Waiting for others (already confirmed)
+)
 
 // PlayerState holds a player's game state.
 type PlayerState struct {
@@ -60,6 +76,7 @@ const (
 	EventRowLocked
 	EventGameOver
 	EventPhaseChanged
+	EventPlayerConfirmed
 )
 
 // Game is the core game state machine.
@@ -73,20 +90,15 @@ type Game struct {
 	LockedRows   map[Color]string // Color -> PlayerID who locked it
 	TurnNumber   int
 
-	// Phase 1 tracking: which players have acted (marked or passed)
-	Phase1Actions map[string]bool
-
-	// Whether the active player marked anything this turn
-	// (in either phase; if not, they get a penalty)
-	ActiveMarkedPhase1 bool
-	ActiveMarkedPhase2 bool
+	// Per-player action tracking for the current turn
+	Actions map[string]*PlayerAction
 
 	// RNG
 	rng *rand.Rand
 
 	// Per-subscriber event broadcast
 	subscriberMu sync.RWMutex
-	subscribers  map[string]chan GameEvent // playerID -> channel
+	subscribers  map[string]chan GameEvent
 
 	// Game over reason
 	GameOverReason string
@@ -99,19 +111,18 @@ type Game struct {
 // NewGame creates a new game with the given players.
 func NewGame(players []*PlayerState, timeout time.Duration) *Game {
 	g := &Game{
-		Players:       players,
-		Phase:         PhaseRolling,
-		ActivePlayer:  0,
-		LockedRows:    make(map[Color]string),
-		Phase1Actions: make(map[string]bool),
-		rng:           rand.New(rand.NewSource(time.Now().UnixNano())),
-		subscribers:   make(map[string]chan GameEvent),
-		TurnNumber:    1,
-		stopLoop:      make(chan struct{}),
-		loopDone:      make(chan struct{}),
+		Players:      players,
+		Phase:        PhaseRolling,
+		ActivePlayer: 0,
+		LockedRows:   make(map[Color]string),
+		Actions:      make(map[string]*PlayerAction),
+		rng:          rand.New(rand.NewSource(time.Now().UnixNano())),
+		subscribers:  make(map[string]chan GameEvent),
+		TurnNumber:   1,
+		stopLoop:     make(chan struct{}),
+		loopDone:     make(chan struct{}),
 	}
 
-	// Initialize scorecards
 	for _, p := range players {
 		p.Scorecard = NewScorecard()
 	}
@@ -119,11 +130,10 @@ func NewGame(players []*PlayerState, timeout time.Duration) *Game {
 	return g
 }
 
-// Subscribe registers a player to receive game events. Returns a channel.
+// Subscribe registers a player to receive game events.
 func (g *Game) Subscribe(playerID string) <-chan GameEvent {
 	g.subscriberMu.Lock()
 	defer g.subscriberMu.Unlock()
-
 	ch := make(chan GameEvent, 100)
 	g.subscribers[playerID] = ch
 	return ch
@@ -133,7 +143,6 @@ func (g *Game) Subscribe(playerID string) <-chan GameEvent {
 func (g *Game) Unsubscribe(playerID string) {
 	g.subscriberMu.Lock()
 	defer g.subscriberMu.Unlock()
-
 	if ch, ok := g.subscribers[playerID]; ok {
 		close(ch)
 		delete(g.subscribers, playerID)
@@ -141,8 +150,6 @@ func (g *Game) Unsubscribe(playerID string) {
 }
 
 // StartGameLoop starts the game loop goroutine.
-// With no timer, this just handles the initial dice roll and
-// auto-rolling when turns complete.
 func (g *Game) StartGameLoop() {
 	go g.gameLoop()
 }
@@ -151,7 +158,6 @@ func (g *Game) StartGameLoop() {
 func (g *Game) StopGameLoop() {
 	select {
 	case <-g.stopLoop:
-		// Already stopped
 	default:
 		close(g.stopLoop)
 	}
@@ -161,11 +167,9 @@ func (g *Game) StopGameLoop() {
 func (g *Game) gameLoop() {
 	defer close(g.loopDone)
 
-	// Auto-roll dice at start
+	// Auto-roll at start
 	g.RollDice()
 
-	// Poll for PhaseRolling to auto-roll after turns complete.
-	// No timer -- players take as long as they want.
 	ticker := time.NewTicker(200 * time.Millisecond)
 	defer ticker.Stop()
 
@@ -188,21 +192,28 @@ func (g *Game) gameLoop() {
 	}
 }
 
-// RollDice rolls the dice for the current turn and transitions to Phase 1.
+// RollDice rolls the dice and transitions to the action phase.
 func (g *Game) RollDice() {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
 	if g.Phase != PhaseRolling {
-		return // Idempotent guard
+		return
 	}
 
 	g.CurrentRoll = NewDiceRoll(g.LockedRows)
 	g.CurrentRoll.Roll(g.rng)
-	g.Phase = PhaseWhiteSum
-	g.Phase1Actions = make(map[string]bool)
-	g.ActiveMarkedPhase1 = false
-	g.ActiveMarkedPhase2 = false
+	g.Phase = PhaseAction
+
+	// Initialize per-player actions
+	g.Actions = make(map[string]*PlayerAction)
+	for _, p := range g.Players {
+		g.Actions[p.ID] = &PlayerAction{}
+		// Non-active disconnected players auto-confirm
+		if !p.Connected {
+			g.Actions[p.ID].Confirmed = true
+		}
+	}
 
 	g.broadcast(GameEvent{
 		Type:    EventDiceRolled,
@@ -211,41 +222,87 @@ func (g *Game) RollDice() {
 	})
 }
 
-// GetValidMovesPhase1 returns valid moves for a player during Phase 1.
-func (g *Game) GetValidMovesPhase1(playerID string) []Move {
+// GetPlayerStep returns what step a player is currently on.
+func (g *Game) GetPlayerStep(playerID string) PlayerStep {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
+
+	if g.Phase != PhaseAction {
+		return StepWaiting
+	}
+
+	action := g.Actions[playerID]
+	if action == nil {
+		return StepWaiting
+	}
+
+	if action.Confirmed {
+		return StepWaiting
+	}
+
+	isActive := g.Players[g.ActivePlayer].ID == playerID
+
+	// White step: hasn't decided on white sum yet
+	if !action.WhiteMarked {
+		return StepWhite
+	}
+
+	// Active player: after white, can do color
+	if isActive && !action.ColorMarked {
+		return StepColor
+	}
+
+	// Should be confirmed by now, but just in case
+	return StepDone
+}
+
+// GetValidMoves returns the valid moves for a player's current step.
+func (g *Game) GetValidMoves(playerID string) []Move {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+
+	if g.Phase != PhaseAction {
+		return nil
+	}
+
+	action := g.Actions[playerID]
+	if action == nil || action.Confirmed {
+		return nil
+	}
 
 	player := g.findPlayer(playerID)
-	if player == nil || g.Phase != PhaseWhiteSum {
+	if player == nil {
 		return nil
 	}
-	return ValidMovesPhase1(player.Scorecard, g.CurrentRoll.WhiteSum(), g.LockedRows)
+
+	isActive := g.Players[g.ActivePlayer].ID == playerID
+
+	if !action.WhiteMarked {
+		// White sum moves
+		return ValidMovesPhase1(player.Scorecard, g.CurrentRoll.WhiteSum(), g.LockedRows)
+	}
+
+	if isActive && !action.ColorMarked {
+		// Color combo moves
+		return ValidMovesPhase2(player.Scorecard, g.CurrentRoll, g.LockedRows)
+	}
+
+	return nil
 }
 
-// GetValidMovesPhase2 returns valid moves for the active player during Phase 2.
-func (g *Game) GetValidMovesPhase2(playerID string) []Move {
-	g.mu.RLock()
-	defer g.mu.RUnlock()
-
-	if g.Phase != PhaseColorCombo {
-		return nil
-	}
-	// Only active player can act in Phase 2
-	if g.Players[g.ActivePlayer].ID != playerID {
-		return nil
-	}
-	return ValidMovesPhase2(g.Players[g.ActivePlayer].Scorecard, g.CurrentRoll, g.LockedRows)
-}
-
-// SubmitPhase1Move handles a player's Phase 1 action (mark or pass).
-// Pass move is nil.
-func (g *Game) SubmitPhase1Move(playerID string, move *Move) error {
+// SubmitMark marks a number for a player. The engine determines which step
+// this applies to based on the player's current state.
+func (g *Game) SubmitMark(playerID string, move Move) error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
-	if g.Phase != PhaseWhiteSum {
-		return fmt.Errorf("not in Phase 1")
+	if g.Phase != PhaseAction {
+		return fmt.Errorf("not in action phase")
+	}
+
+	action := g.Actions[playerID]
+	if action == nil || action.Confirmed {
+		return fmt.Errorf("already confirmed")
 	}
 
 	player := g.findPlayer(playerID)
@@ -253,25 +310,20 @@ func (g *Game) SubmitPhase1Move(playerID string, move *Move) error {
 		return fmt.Errorf("player not found")
 	}
 
-	if g.Phase1Actions[playerID] {
-		return fmt.Errorf("already acted this phase")
-	}
+	isActive := g.Players[g.ActivePlayer].ID == playerID
 
-	if move != nil {
-		// Validate the move number matches the white sum
+	if !action.WhiteMarked {
+		// White sum step
 		if move.Number != g.CurrentRoll.WhiteSum() {
-			return fmt.Errorf("Phase 1 move must use the white sum (%d)", g.CurrentRoll.WhiteSum())
+			return fmt.Errorf("must use the white sum (%d)", g.CurrentRoll.WhiteSum())
 		}
-
 		if !IsValidMove(player.Scorecard, move.Color, move.Number, g.LockedRows) {
 			return fmt.Errorf("invalid move")
 		}
 
 		player.Scorecard.Mark(move.Color, move.Number)
-
-		if g.Players[g.ActivePlayer].ID == playerID {
-			g.ActiveMarkedPhase1 = true
-		}
+		action.WhiteMarked = true
+		action.WhiteMove = &move
 
 		g.broadcast(GameEvent{
 			Type:    EventPlayerMarked,
@@ -279,142 +331,117 @@ func (g *Game) SubmitPhase1Move(playerID string, move *Move) error {
 			Message: fmt.Sprintf("%s marked %s %d", player.Nickname, move.Color, move.Number),
 		})
 
-		// Check if this triggers a row lock
 		if ShouldLockRow(player.Scorecard, move.Color, move.Number) {
 			g.lockRow(player, move.Color)
 			if g.checkGameEnd() {
 				return nil
 			}
 		}
-	} else {
+
+		// Non-active players auto-confirm after white step
+		if !isActive {
+			action.Confirmed = true
+			g.checkAllConfirmed()
+		}
+
+		return nil
+	}
+
+	if isActive && !action.ColorMarked {
+		// Color combo step
+		if !g.isValidPhase2Combo(&move) {
+			return fmt.Errorf("does not match any white+colored die combination")
+		}
+		if !IsValidMove(player.Scorecard, move.Color, move.Number, g.LockedRows) {
+			return fmt.Errorf("invalid move")
+		}
+
+		player.Scorecard.Mark(move.Color, move.Number)
+		action.ColorMarked = true
+		action.ColorMove = &move
+
+		g.broadcast(GameEvent{
+			Type:    EventPlayerMarked,
+			Player:  player.Nickname,
+			Message: fmt.Sprintf("%s marked %s %d", player.Nickname, move.Color, move.Number),
+		})
+
+		if ShouldLockRow(player.Scorecard, move.Color, move.Number) {
+			g.lockRow(player, move.Color)
+			if g.checkGameEnd() {
+				return nil
+			}
+		}
+
+		// Active player done after color step
+		action.Confirmed = true
+		g.checkAllConfirmed()
+
+		return nil
+	}
+
+	return fmt.Errorf("no pending action")
+}
+
+// SubmitPass skips the current step for a player.
+func (g *Game) SubmitPass(playerID string) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	if g.Phase != PhaseAction {
+		return fmt.Errorf("not in action phase")
+	}
+
+	action := g.Actions[playerID]
+	if action == nil || action.Confirmed {
+		return fmt.Errorf("already confirmed")
+	}
+
+	player := g.findPlayer(playerID)
+	if player == nil {
+		return fmt.Errorf("player not found")
+	}
+
+	isActive := g.Players[g.ActivePlayer].ID == playerID
+
+	if !action.WhiteMarked {
+		// Pass on white sum
+		action.WhiteMarked = true // Marked as "decided" (but no move)
+
 		g.broadcast(GameEvent{
 			Type:    EventPlayerPassed,
 			Player:  player.Nickname,
 			Message: fmt.Sprintf("%s passed", player.Nickname),
 		})
-	}
 
-	g.Phase1Actions[playerID] = true
-
-	// Check if all connected players have acted
-	if g.allPlayersActed() {
-		g.transitionToPhase2()
-	}
-
-	return nil
-}
-
-// SubmitPhase2Move handles the active player's Phase 2 action (mark or pass).
-func (g *Game) SubmitPhase2Move(playerID string, move *Move) error {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-
-	if g.Phase != PhaseColorCombo {
-		return fmt.Errorf("not in Phase 2")
-	}
-
-	if g.Players[g.ActivePlayer].ID != playerID {
-		return fmt.Errorf("not the active player")
-	}
-
-	player := g.Players[g.ActivePlayer]
-
-	if move != nil {
-		// Validate the move matches an actual dice combo
-		if !g.isValidPhase2Combo(move) {
-			return fmt.Errorf("move does not match any white+colored die combination")
-		}
-
-		if !IsValidMove(player.Scorecard, move.Color, move.Number, g.LockedRows) {
-			return fmt.Errorf("invalid move")
-		}
-
-		player.Scorecard.Mark(move.Color, move.Number)
-		g.ActiveMarkedPhase2 = true
-
-		g.broadcast(GameEvent{
-			Type:    EventPlayerMarked,
-			Player:  player.Nickname,
-			Message: fmt.Sprintf("%s marked %s %d", player.Nickname, move.Color, move.Number),
-		})
-
-		// Check row lock
-		if ShouldLockRow(player.Scorecard, move.Color, move.Number) {
-			g.lockRow(player, move.Color)
-			if g.checkGameEnd() {
-				return nil
-			}
-		}
-	}
-
-	// If the active player didn't mark anything in either phase, penalty
-	if !g.ActiveMarkedPhase1 && !g.ActiveMarkedPhase2 {
-		fourPenalties := player.Scorecard.AddPenalty()
-		g.broadcast(GameEvent{
-			Type:    EventPlayerPenalty,
-			Player:  player.Nickname,
-			Message: fmt.Sprintf("%s takes a penalty! (%d/4)", player.Nickname, player.Scorecard.Penalties),
-		})
-
-		if fourPenalties {
-			g.endGame(fmt.Sprintf("%s got 4 penalties!", player.Nickname))
+		// Non-active players are done
+		if !isActive {
+			action.Confirmed = true
+			g.checkAllConfirmed()
 			return nil
 		}
+
+		// Active player moves to color step (don't auto-confirm)
+		return nil
 	}
 
-	g.nextTurn()
-	return nil
-}
+	if isActive && !action.ColorMarked {
+		// Pass on color combo
+		action.ColorMarked = true
 
-// AutoPassPhase1 auto-passes all players who haven't acted in Phase 1.
-func (g *Game) AutoPassPhase1() {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-
-	if g.Phase != PhaseWhiteSum {
-		return
-	}
-
-	for _, p := range g.Players {
-		if p.Connected && !g.Phase1Actions[p.ID] {
-			g.Phase1Actions[p.ID] = true
-			g.broadcast(GameEvent{
-				Type:    EventPlayerPassed,
-				Player:  p.Nickname,
-				Message: fmt.Sprintf("%s auto-passed", p.Nickname),
-			})
-		}
-	}
-
-	g.transitionToPhase2()
-}
-
-// AutoPassPhase2 auto-passes the active player in Phase 2.
-func (g *Game) AutoPassPhase2() {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-
-	if g.Phase != PhaseColorCombo {
-		return
-	}
-
-	player := g.Players[g.ActivePlayer]
-
-	if !g.ActiveMarkedPhase1 && !g.ActiveMarkedPhase2 {
-		fourPenalties := player.Scorecard.AddPenalty()
 		g.broadcast(GameEvent{
-			Type:    EventPlayerPenalty,
+			Type:    EventPlayerPassed,
 			Player:  player.Nickname,
-			Message: fmt.Sprintf("%s takes a penalty! (%d/4)", player.Nickname, player.Scorecard.Penalties),
+			Message: fmt.Sprintf("%s passed on color combo", player.Nickname),
 		})
 
-		if fourPenalties {
-			g.endGame(fmt.Sprintf("%s got 4 penalties!", player.Nickname))
-			return
-		}
+		// Active player done
+		action.Confirmed = true
+		g.checkAllConfirmed()
+		return nil
 	}
 
-	g.nextTurn()
+	return fmt.Errorf("no pending action")
 }
 
 // DisconnectPlayer marks a player as disconnected.
@@ -429,25 +456,14 @@ func (g *Game) DisconnectPlayer(playerID string) {
 		}
 	}
 
-	// If they hadn't acted in phase 1, mark them as acted
-	if g.Phase == PhaseWhiteSum && !g.Phase1Actions[playerID] {
-		g.Phase1Actions[playerID] = true
-		if g.allPlayersActed() {
-			g.transitionToPhase2()
+	// Auto-confirm if in action phase
+	if g.Phase == PhaseAction {
+		if action := g.Actions[playerID]; action != nil && !action.Confirmed {
+			action.WhiteMarked = true
+			action.ColorMarked = true
+			action.Confirmed = true
+			g.checkAllConfirmed()
 		}
-	}
-
-	// If they're the active player in phase 2, auto-pass
-	if g.Phase == PhaseColorCombo && g.Players[g.ActivePlayer].ID == playerID {
-		if !g.ActiveMarkedPhase1 && !g.ActiveMarkedPhase2 {
-			player := g.Players[g.ActivePlayer]
-			fourPenalties := player.Scorecard.AddPenalty()
-			if fourPenalties {
-				g.endGame(fmt.Sprintf("%s got 4 penalties!", player.Nickname))
-				return
-			}
-		}
-		g.nextTurn()
 	}
 
 	// Check if all players disconnected
@@ -494,51 +510,44 @@ type PlayerScore struct {
 	Total     int
 }
 
-// --- Snapshot accessors (return copies, safe for concurrent reads) ---
+// --- Snapshot accessors ---
 
-// GetPhase returns the current game phase (thread-safe).
 func (g *Game) GetPhase() GamePhase {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
 	return g.Phase
 }
 
-// GetGameOverReason returns the game over reason (thread-safe).
 func (g *Game) GetGameOverReason() string {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
 	return g.GameOverReason
 }
 
-// GetActivePlayerNickname returns the active player's nickname (thread-safe).
 func (g *Game) GetActivePlayerNickname() string {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
 	return g.Players[g.ActivePlayer].Nickname
 }
 
-// GetActivePlayerID returns the active player's ID (thread-safe).
 func (g *Game) GetActivePlayerID() string {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
 	return g.Players[g.ActivePlayer].ID
 }
 
-// GetTurnNumber returns the current turn number (thread-safe).
 func (g *Game) GetTurnNumber() int {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
 	return g.TurnNumber
 }
 
-// HasPlayerActedPhase1 checks if a player has acted in Phase 1 (thread-safe).
-func (g *Game) HasPlayerActedPhase1(playerID string) bool {
+func (g *Game) IsActivePlayer(playerID string) bool {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
-	return g.Phase1Actions[playerID]
+	return g.Players[g.ActivePlayer].ID == playerID
 }
 
-// GetLockedRows returns a copy of the locked rows map (thread-safe).
 func (g *Game) GetLockedRows() map[Color]string {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
@@ -560,12 +569,10 @@ type DiceRollSnapshot struct {
 	ActiveColors map[Color]bool
 }
 
-// WhiteSum returns the sum of the two white dice.
 func (s *DiceRollSnapshot) WhiteSum() int {
 	return s.White1 + s.White2
 }
 
-// GetCurrentRollSnapshot returns a copy of the current dice roll (thread-safe).
 func (g *Game) GetCurrentRollSnapshot() *DiceRollSnapshot {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
@@ -593,10 +600,9 @@ type PlayerSnapshot struct {
 	Nickname  string
 	Penalties int
 	Connected bool
-	Marks     map[Color]map[int]bool // Copy of scorecard marks
+	Marks     map[Color]map[int]bool
 }
 
-// GetPlayerSnapshots returns copies of all player states (thread-safe).
 func (g *Game) GetPlayerSnapshots() []PlayerSnapshot {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
@@ -632,35 +638,39 @@ func (g *Game) findPlayer(playerID string) *PlayerState {
 	return nil
 }
 
-func (g *Game) allPlayersActed() bool {
+func (g *Game) checkAllConfirmed() {
 	for _, p := range g.Players {
-		if p.Connected && !g.Phase1Actions[p.ID] {
-			return false
+		action := g.Actions[p.ID]
+		if action == nil || !action.Confirmed {
+			return
 		}
 	}
-	return true
+	// Everyone confirmed -- end the turn
+	g.endTurn()
 }
 
-func (g *Game) transitionToPhase2() {
-	g.Phase = PhaseColorCombo
+func (g *Game) endTurn() {
+	// Check if active player marked anything
+	activeID := g.Players[g.ActivePlayer].ID
+	action := g.Actions[activeID]
 
-	// Skip disconnected active player
-	if !g.Players[g.ActivePlayer].Connected {
-		if !g.ActiveMarkedPhase1 {
-			fourPenalties := g.Players[g.ActivePlayer].Scorecard.AddPenalty()
-			if fourPenalties {
-				g.endGame(fmt.Sprintf("%s got 4 penalties!", g.Players[g.ActivePlayer].Nickname))
-				return
-			}
+	activeMarkedAnything := (action.WhiteMove != nil) || (action.ColorMove != nil)
+
+	if !activeMarkedAnything {
+		player := g.Players[g.ActivePlayer]
+		fourPenalties := player.Scorecard.AddPenalty()
+		g.broadcast(GameEvent{
+			Type:    EventPlayerPenalty,
+			Player:  player.Nickname,
+			Message: fmt.Sprintf("%s takes a penalty! (%d/4)", player.Nickname, player.Scorecard.Penalties),
+		})
+		if fourPenalties {
+			g.endGame(fmt.Sprintf("%s got 4 penalties!", player.Nickname))
+			return
 		}
-		g.nextTurn()
-		return
 	}
 
-	g.broadcast(GameEvent{
-		Type:    EventPhaseChanged,
-		Message: fmt.Sprintf("%s: pick a white+color combo or pass", g.Players[g.ActivePlayer].Nickname),
-	})
+	g.nextTurn()
 }
 
 func (g *Game) nextTurn() {
@@ -683,18 +693,15 @@ func (g *Game) nextTurn() {
 
 	g.broadcast(GameEvent{
 		Type:    EventPhaseChanged,
-		Message: fmt.Sprintf("Turn %d: %s's turn to roll", g.TurnNumber, g.Players[g.ActivePlayer].Nickname),
+		Message: fmt.Sprintf("Turn %d: %s rolls!", g.TurnNumber, g.Players[g.ActivePlayer].Nickname),
 	})
 }
 
 func (g *Game) lockRow(player *PlayerState, c Color) {
 	g.LockedRows[c] = player.ID
-
-	// Update current roll to remove the locked die
 	if g.CurrentRoll != nil {
 		delete(g.CurrentRoll.ActiveColors, c)
 	}
-
 	g.broadcast(GameEvent{
 		Type:    EventRowLocked,
 		Player:  player.Nickname,
@@ -717,8 +724,6 @@ func (g *Game) endGame(reason string) {
 		Type:    EventGameOver,
 		Message: fmt.Sprintf("Game Over! %s", reason),
 	})
-
-	// Stop the game loop
 	select {
 	case <-g.stopLoop:
 	default:
@@ -726,7 +731,6 @@ func (g *Game) endGame(reason string) {
 	}
 }
 
-// isValidPhase2Combo checks that the move matches an actual white+colored die combo.
 func (g *Game) isValidPhase2Combo(move *Move) bool {
 	combos := g.CurrentRoll.ColorCombos()
 	for _, combo := range combos {
@@ -737,11 +741,9 @@ func (g *Game) isValidPhase2Combo(move *Move) bool {
 	return false
 }
 
-// broadcast sends an event to all subscribers.
 func (g *Game) broadcast(event GameEvent) {
 	g.subscriberMu.RLock()
 	defer g.subscriberMu.RUnlock()
-
 	for _, ch := range g.subscribers {
 		select {
 		case ch <- event:
