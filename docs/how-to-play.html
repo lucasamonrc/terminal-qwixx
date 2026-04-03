@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>How to Play — Qwixx</title>
+  <meta name="description" content="Learn how to play Qwixx, the fast-paced multiplayer dice game you play right in your terminal.">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="page">
+
+    <!-- Title -->
+    <header>
+      <a href="index.html" style="text-decoration: none;"><span class="title-bar">QWIXX</span></a>
+      <p class="tagline"><a href="index.html">&larr; Back</a></p>
+    </header>
+
+    <!-- Rules -->
+    <section class="rules" style="margin-top: 2rem;">
+
+      <h2>Overview</h2>
+      <p>
+        Qwixx is a fast dice game for <strong>2&ndash;5 players</strong>.
+        Everyone has a scorecard with four colored rows of numbers.
+        On each turn one player rolls the dice and all players choose whether to mark numbers on their card.
+        The goal is to mark as many numbers as possible to maximize your score.
+      </p>
+
+      <h2>The Scorecard</h2>
+      <p>Your card has four rows, each with 11 numbers:</p>
+      <ul>
+        <li><span class="color-dot" style="background: var(--red);"></span> <strong>Red</strong> &mdash; 2 to 12 (ascending)</li>
+        <li><span class="color-dot" style="background: var(--yellow);"></span> <strong>Yellow</strong> &mdash; 2 to 12 (ascending)</li>
+        <li><span class="color-dot" style="background: var(--green);"></span> <strong>Green</strong> &mdash; 12 to 2 (descending)</li>
+        <li><span class="color-dot" style="background: var(--blue);"></span> <strong>Blue</strong> &mdash; 12 to 2 (descending)</li>
+      </ul>
+      <p>
+        You must always mark numbers <strong>left to right</strong>.
+        Any numbers you skip are permanently lost &mdash; you can never go back.
+      </p>
+
+      <h2>Turn Structure</h2>
+      <p>
+        One player is the <strong>roller</strong> each turn. They roll 6 dice:
+        2 white + 1 red, 1 yellow, 1 green, 1 blue.
+      </p>
+      <p>Each turn has two phases:</p>
+      <ul>
+        <li>
+          <strong>Phase 1 &mdash; White Sum:</strong>
+          The two white dice are added together. <em>All</em> players may mark that sum on <em>any</em> row, or pass.
+        </li>
+        <li>
+          <strong>Phase 2 &mdash; Color Combo:</strong>
+          <em>Only the roller</em> may add one white die to one colored die and mark that sum on the matching colored row, or pass.
+        </li>
+      </ul>
+      <p>
+        If the roller marks nothing in <em>either</em> phase, they take a <strong>penalty</strong> (&minus;5 points).
+      </p>
+
+      <h2>Locking a Row</h2>
+      <p>
+        The rightmost number in each row (12 for Red/Yellow, 2 for Green/Blue) can only be marked
+        if you already have <strong>at least 5 marks</strong> in that row.
+        When someone marks it, the row <strong>locks</strong> for all players and that colored die is removed from the game.
+      </p>
+
+      <h2>Game End</h2>
+      <p>The game ends immediately when either:</p>
+      <ul>
+        <li><strong>2 rows</strong> are locked (by any combination of players), or</li>
+        <li>A player takes their <strong>4th penalty</strong>.</li>
+      </ul>
+
+      <h2>Scoring</h2>
+      <p>
+        Each row scores based on how many marks you made.
+        More marks are worth disproportionately more &mdash; every additional mark is worth more than the last.
+      </p>
+      <table class="score-table">
+        <tr>
+          <th>Marks</th>
+          <th>1</th><th>2</th><th>3</th><th>4</th><th>5</th>
+          <th>6</th><th>7</th><th>8</th><th>9</th><th>10</th><th>11</th><th>12</th>
+        </tr>
+        <tr>
+          <td>Points</td>
+          <td>1</td><td>3</td><td>6</td><td>10</td><td>15</td>
+          <td>21</td><td>28</td><td>36</td><td>45</td><td>55</td><td>66</td><td>78</td>
+        </tr>
+      </table>
+      <p>
+        Each penalty costs <strong>&minus;5 points</strong>.
+        Add up all four rows and subtract penalties. Highest total wins.
+      </p>
+
+      <h2>Controls</h2>
+      <table class="controls-table">
+        <tr><td><code>&uarr;</code> <code>&darr;</code> <code>&larr;</code> <code>&rarr;</code></td><td>Move cursor on the scorecard</td></tr>
+        <tr><td><code>Enter</code> / <code>Space</code></td><td>Mark the number under cursor</td></tr>
+        <tr><td><code>P</code></td><td>Pass (skip this phase)</td></tr>
+        <tr><td><code>Ctrl+C</code></td><td>Quit the game</td></tr>
+      </table>
+      <p>You can also use <code>h</code><code>j</code><code>k</code><code>l</code> (vim-style) to move.</p>
+
+    </section>
+
+    <!-- Navigation -->
+    <nav class="nav">
+      <a href="index.html"><span class="arrow">&gt;</span> Play now</a>
+      <a href="https://github.com/lucasacastro/qwixx"><span class="arrow">&gt;</span> Source code</a>
+    </nav>
+
+    <!-- Footer -->
+    <footer class="footer">
+      Built with Go + <a href="https://charm.sh">Charm</a>. Served over SSH.
+    </footer>
+
+  </div>
+</body>
+</html>

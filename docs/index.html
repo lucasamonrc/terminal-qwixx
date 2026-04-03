@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Qwixx — Multiplayer dice game in your terminal</title>
+  <meta name="description" content="Play the classic Qwixx dice game with friends, right in your terminal over SSH. No installation needed.">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="page">
+
+    <!-- Title -->
+    <header>
+      <span class="title-bar">QWIXX</span>
+      <p class="tagline">Multiplayer dice game in your terminal. No install needed.</p>
+    </header>
+
+    <!-- SSH Command -->
+    <section class="ssh-section">
+      <div class="ssh-label">Connect and play:</div>
+      <div class="ssh-box">
+        <code class="ssh-command"><span class="prompt">$ </span>ssh -p 2222 lucasacastro.cloud</code>
+        <button class="copy-btn" onclick="copySSH(this)">copy</button>
+      </div>
+    </section>
+
+    <!-- Terminal Preview -->
+    <div class="terminal">
+      <div class="terminal-titlebar">
+        <span class="terminal-dot red"></span>
+        <span class="terminal-dot yellow"></span>
+        <span class="terminal-dot green"></span>
+        <span class="terminal-title">qwixx &mdash; ssh</span>
+      </div>
+      <div class="terminal-body">
+<span class="t-title"> Turn 3 </span>  <span class="t-highlight"> You rolled </span>  <span class="t-sub">Mark the white sum or pass</span>
+
+  Dice:  <span class="die-white"> 5 </span>  <span class="die-white"> 3 </span>    <span class="die-red"> 4 </span>    <span class="die-yellow"> 2 </span>    <span class="die-green"> 6 </span>    <span class="die-blue"> 1 </span>      White sum = <span class="white-sum"> 8 </span>
+  <span class="t-sub">You can mark 8 on any row</span>
+
+  <span class="row-red">Red   </span>  <span class="marked-red"> 2</span> <span class="marked-red"> 3</span> <span class="marked-red"> 4</span> <span class="t-dim"> 5</span> <span class="t-dim"> 6</span> <span class="t-dim"> 7</span> <span class="cursor-valid"> 8</span> <span class="t-dim"> 9</span> <span class="t-dim">10</span> <span class="t-dim">11</span> <span class="t-dim">12</span>  <span class="t-sub">(3)</span>
+  <span class="row-yellow">Yellow</span>  <span class="marked-yellow"> 2</span> <span class="t-dim"> 3</span> <span class="t-dim"> 4</span> <span class="t-dim"> 5</span> <span class="t-dim"> 6</span> <span class="t-dim"> 7</span> <span class="t-dim"> 8</span> <span class="t-dim"> 9</span> <span class="t-dim">10</span> <span class="t-dim">11</span> <span class="t-dim">12</span>  <span class="t-sub">(1)</span>
+  <span class="row-green">Green </span>  <span class="t-dim">12</span> <span class="t-dim">11</span> <span class="marked-green">10</span> <span class="marked-green"> 9</span> <span class="valid-move"> 8</span> <span class="t-dim"> 7</span> <span class="t-dim"> 6</span> <span class="t-dim"> 5</span> <span class="t-dim"> 4</span> <span class="t-dim"> 3</span> <span class="t-dim"> 2</span>  <span class="t-sub">(2)</span>
+  <span class="row-blue">Blue  </span>  <span class="t-dim">12</span> <span class="t-dim">11</span> <span class="t-dim">10</span> <span class="t-dim"> 9</span> <span class="t-dim"> 8</span> <span class="t-dim"> 7</span> <span class="t-dim"> 6</span> <span class="t-dim"> 5</span> <span class="t-dim"> 4</span> <span class="t-dim"> 3</span> <span class="t-dim"> 2</span>  <span class="t-sub">(0)</span>
+
+  Penalties: <span class="penalty-empty">[ ]</span><span class="penalty-empty">[ ]</span><span class="penalty-empty">[ ]</span><span class="penalty-empty">[ ]</span>  <span class="t-sub">(-0 pts)</span>
+
+  Players: <span class="t-highlight">lucas (you)</span> <span class="t-sub">(roller)</span>  |  <span class="t-sub">maria</span>  |  <span class="t-sub">pedro</span>
+
+  <span class="t-sub">Arrows to move  |  Enter to mark white sum  |  P to pass</span><span class="blink">_</span></div>
+    </div>
+
+    <!-- Navigation -->
+    <nav class="nav">
+      <a href="how-to-play.html"><span class="arrow">&gt;</span> How to play</a>
+      <a href="https://github.com/lucasacastro/qwixx"><span class="arrow">&gt;</span> Source code</a>
+    </nav>
+
+    <!-- Footer -->
+    <footer class="footer">
+      Built with Go + <a href="https://charm.sh">Charm</a>. Served over SSH.
+    </footer>
+
+  </div>
+
+  <script>
+    function copySSH(btn) {
+      navigator.clipboard.writeText("ssh -p 2222 lucasacastro.cloud").then(function() {
+        btn.textContent = "copied!";
+        btn.classList.add("copied");
+        setTimeout(function() {
+          btn.textContent = "copy";
+          btn.classList.remove("copied");
+        }, 2000);
+      });
+    }
+  </script>
+</body>
+</html>
