@@ -16,11 +16,12 @@ echo "==> Building for Linux..."
 GOOS=linux GOARCH=amd64 go build -o qwixx .
 
 echo "==> Copying binary to $VPS..."
-scp ./qwixx "${VPS}:/opt/qwixx/qwixx.new"
+scp ./qwixx "${VPS}:/tmp/qwixx.new"
 
 echo "==> Restarting service..."
 ssh "$VPS" '
-    sudo mv /opt/qwixx/qwixx.new /opt/qwixx/qwixx
+    sudo mv /tmp/qwixx.new /opt/qwixx/qwixx
+    sudo chown qwixx:qwixx /opt/qwixx/qwixx
     sudo chmod +x /opt/qwixx/qwixx
     sudo systemctl restart qwixx
     sleep 2

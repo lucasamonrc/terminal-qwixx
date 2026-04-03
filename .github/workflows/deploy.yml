@@ -47,11 +47,12 @@ jobs:
           ssh-keyscan -H "$VPS_HOST" >> ~/.ssh/known_hosts 2>/dev/null
 
           # Copy binary to VPS
-          scp -i ~/.ssh/deploy_key ./qwixx "${VPS_USER}@${VPS_HOST}:/opt/qwixx/qwixx.new"
+          scp -i ~/.ssh/deploy_key ./qwixx "${VPS_USER}@${VPS_HOST}:/tmp/qwixx.new"
 
           # Swap and restart on VPS
           ssh -i ~/.ssh/deploy_key "${VPS_USER}@${VPS_HOST}" << 'EOF'
-            sudo mv /opt/qwixx/qwixx.new /opt/qwixx/qwixx
+            sudo mv /tmp/qwixx.new /opt/qwixx/qwixx
+            sudo chown qwixx:qwixx /opt/qwixx/qwixx
             sudo chmod +x /opt/qwixx/qwixx
             sudo systemctl restart qwixx
             sleep 2

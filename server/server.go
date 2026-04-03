@@ -17,6 +17,7 @@ import (
 	bm "github.com/charmbracelet/wish/bubbletea"
 	"github.com/lucasacastro/qwixx/lobby"
 	"github.com/lucasacastro/qwixx/tui"
+	"github.com/muesli/termenv"
 )
 
 var playerCounter atomic.Int64
@@ -48,7 +49,7 @@ func (s *Server) Start() error {
 		wish.WithHostKeyPath(".ssh/host_key"),
 		wish.WithMiddleware(
 			s.cleanupMiddleware(),
-			bm.Middleware(s.teaHandler),
+			bm.MiddlewareWithColorProfile(s.teaHandler, termenv.TrueColor),
 		),
 	)
 	if err != nil {
